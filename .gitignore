@@ -1,0 +1,7 @@
+﻿/vendor/
+/node_modules/
+config/database.php
+config/database.json
+*.log
+Thumbs.db
+.DS_Store

@@ -1,0 +1,15 @@
+#
+# Minimal OpenSSL yapilandirmasi
+#
+# Windows / Plesk PHP kurulumlarinda openssl.cnf sistemde tanimli olmadigi icin
+# openssl_pkey_new() sessizce false doner. WebPush.php efemeral EC anahtar
+# uretirken bu dosyayi ['config' => ...] ile acikca gecer.
+#
+# Bu dosya gizli bilgi icermez, silinmemelidir.
+#
+
+[req]
+default_bits       = 2048
+distinguished_name = dn
+
+[dn]
