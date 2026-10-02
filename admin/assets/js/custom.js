@@ -388,5 +388,11 @@ $(document).ready(function () {
         return new bootstrap.Tooltip(tooltipTriggerEl);
     });
 
+    // Modal kapanırken içindeki odağı bırak: aksi halde Bootstrap aria-hidden verirken
+    // "Blocked aria-hidden ... descendant retained focus" uyarısı oluşur
+    $(document).on('hide.bs.modal', '.modal', function () {
+        if (this.contains(document.activeElement)) document.activeElement.blur();
+    });
+
     console.log('✅ ORNEK Yazilim Portal - Ortak fonksiyonlar yüklendi');
 });
