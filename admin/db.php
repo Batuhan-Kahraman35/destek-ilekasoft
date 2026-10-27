@@ -192,12 +192,19 @@ class Database {
      * @return bool Başarı durumu
      */
     public function executeRaw($sql) {
-        // Önce çok satırlı yorumları temizle
-        $sql = preg_replace('/\/\*.*?\*\//s', '', $sql);
-        
-        // Tek satırlık yorumları temizle
-        $sql = preg_replace('/--[^\r\n]*/', '', $sql);
-        
+        // Yorumlari temizle; ANCAK string ('...' / N'...') icindeki --, /* */ dizilerini KORU.
+        // (surum aciklamalarinda --ek-dosya, --silent, conhost --headless, CSS --bs-* gibi ifadeler gecer;
+        //  bunlar yorum degil veridir. Oncesinde bu diziler silinip string ortadan kesilince tirnak dengesi bozuluyordu.)
+        $sql = preg_replace_callback(
+            "/N?'(?:[^']|'')*'|--[^\r\n]*|\\/\\*.*?\\*\\//s",
+            function ($m) {
+                $t = $m[0];
+                // String literal ise (' ya da N' ile baslar) oldugu gibi birak; degilse (yorum) sil
+                return ($t[0] === "'" || ($t[0] === 'N' && isset($t[1]) && $t[1] === "'")) ? $t : '';
+            },
+            $sql
+        );
+
         // GO komutlarını ayır
         $batches = preg_split('/^\s*GO\s*$/im', $sql);
         

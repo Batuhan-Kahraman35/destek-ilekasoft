@@ -13,19 +13,27 @@
  *   php admin/cron/ticket-ajan.php guncelle 246 --durum=3 --atanan=ben
  *   php admin/cron/ticket-ajan.php guncelle 246 --atanan=bos --oncelik=2
  *   php admin/cron/ticket-ajan.php yanit 246 --mesaj-dosya=temp/yanit.txt --durum=Cozuldu --atanan=ben --onizleme
+ *   php admin/cron/ticket-ajan.php ara "Hepsiburada key" --proje=PORTAL --durum=acik
+ *   php admin/cron/ticket-ajan.php ac --konu="[Takip] ..." --mesaj-dosya=temp/takip.txt --proje=PORTAL --durum=Beklemede --onizleme
+ *
+ * ara: konu ve mesajlarda (ic notlar dahil) arar; her kelime konu veya bir mesajda gecmelidir.
+ *      Acik ve kapali tum ticket'lar doner. --proje kaynak kodu veya host olabilir.
+ * ac:  yeni ticket acar (TicketService::ticketOlustur, panel ile ayni). Kategori/oncelik verilmezse
+ *      Genel/Normal; --atanan verilmezse ben. Ayni konulu ticket varsa acilmaz (--zorla ile acilir).
  *
  * Seçenekler:
- *   --kaynak=KOD      Ajanın kullanacağı kaynak kodu (varsayılan: BATUHAN)
+ *   --kaynak=KOD      Yanıtı yazacak kaynak kodu (varsayılan: AI → ORNEKYAZILIM AI; kendi adınıza: --kaynak=BATUHAN)
  *   --mesaj-dosya=    Müşteriye gidecek yanıt metnini içeren dosya
  *   --icnot-dosya=    Yalnızca ekipte görünecek iç not metnini içeren dosya
+ *   --ek-dosya=       Müşteri yanıtına eklenecek dosya(lar), virgülle ayrılır (resim/PDF/Office/txt, en fazla 10 MB)
  *   --durum=ID        Ticket durumunu günceller (opsiyonel)
  *   --oncelik=ID      Ticket önceliğini günceller (opsiyonel)
  *   --kategori=ID     Ticket kategorisini günceller (yalnizca guncelle komutunda)
- *   --atanan=X        Personel atar. X: kullanici_id | "ben" (kaynak kullanicisi) | "bos" (atamayi kaldirir)
+ *   --atanan=X        Personel atar. X: kullanici_id | "ben" (BATUHAN kaynagi kullanicisi) | "ajan" (yaniti yazan hesap) | "bos" (atamayi kaldirir)
  *   --onizleme        Taslak modu: hicbir kayit yazilmaz, bildirim gonderilmez, plan raporlanir
  *
- * Not: yanit komutunda --atanan verilmezse ve ticket kimseye atanmamissa, ticket yaniti
- * yazan kullaniciya otomatik atanir. Ticket zaten atanmissa atamaya dokunulmaz.
+ * Not: yanit komutunda --atanan verilmezse ve ticket kimseye atanmamissa, ticket ajanin
+ * sahibine (BATUHAN kaynagi kullanicisi) otomatik atanir. Ticket zaten atanmissa atamaya dokunulmaz.
  * Otomatik atamayi istemiyorsaniz --atanan=bos kullanin.
  *   --vhost-root=     Proje dizini araması için kök (varsayılan: d:/Inetpub/vhosts)
  */
@@ -38,7 +46,8 @@ if (php_sapi_name() !== 'cli') {
 require_once __DIR__ . '/../db.php';
 require_once __DIR__ . '/../includes/TicketService.php';
 
-const AJAN_VARSAYILAN_KAYNAK = 'BATUHAN';
+const AJAN_VARSAYILAN_KAYNAK = 'AI';
+const AJAN_SAHIP_KAYNAK      = 'BATUHAN';
 
 /**
  * Argümanları ayrıştırır: konumsal argümanlar + --anahtar=deger seçenekleri
@@ -168,6 +177,28 @@ function ajanKaynagiGetir(Database $db, string $kaynakKod): array
 }
 
 /**
+ * Ajanı ve ajanın sahibini getirir.
+ * kullanici: yanıtı yazan hesap (AI kaynağı), sahip: "ben" / otomatik atamada kullanılan personel (BATUHAN kaynağı).
+ */
+function ajanGetir(Database $db, string $kaynakKod, string $sahipKod): array
+{
+    $ajan = ajanKaynagiGetir($db, $kaynakKod);
+    $ajan['sahip'] = $kaynakKod === $sahipKod
+        ? $ajan['kullanici']
+        : ajanKaynagiGetir($db, $sahipKod)['kullanici'];
+
+    return $ajan;
+}
+
+/**
+ * Atama bildiriminde "kendine atama" sayılan kullanıcılar: işlemi yapan hesap ve ajanın sahibi.
+ */
+function kendiKullaniciIdleri(array $ajan): array
+{
+    return array_unique([(int)$ajan['kullanici']['kullanici_id'], (int)$ajan['sahip']['kullanici_id']]);
+}
+
+/**
  * --onizleme / --taslak bayragini okur.
  * Onizleme modunda hicbir kayit yazilmaz, bildirim tetiklenmez;
  * yalnizca yapilacak islemin plani dondurulur.
@@ -292,7 +323,11 @@ function atananCoz(Database $db, ?string $deger, array $ajan): ?int
         return 0;
     }
 
-    if (in_array($deger, ['ben', 'kendim', 'ajan'], true)) {
+    if (in_array($deger, ['ben', 'kendim'], true)) {
+        return (int)$ajan['sahip']['kullanici_id'];
+    }
+
+    if ($deger === 'ajan') {
         return (int)$ajan['kullanici']['kullanici_id'];
     }
 
@@ -403,12 +438,12 @@ function alanGuncellemeHazirla(Database $db, int $ticketId, array $ajan, array $
 /**
  * Atama bildiriminin gonderilip gonderilmeyecegini yazmadan hesaplar (onizleme icin).
  */
-function atamaBildirimiPlani(?array $atama, int $islemKullaniciId): string
+function atamaBildirimiPlani(?array $atama, array $kendiIdler): string
 {
     if (!$atama || $atama['yeni'] <= 0) {
         return 'gonderilmeyecek';
     }
-    if ($atama['yeni'] === $atama['eski'] || $atama['yeni'] === $islemKullaniciId) {
+    if ($atama['yeni'] === $atama['eski'] || in_array($atama['yeni'], $kendiIdler, true)) {
         return 'gonderilmeyecek (kendine atama veya degisiklik yok)';
     }
     return 'gonderilecek (ticket_atandi)';
@@ -417,13 +452,13 @@ function atamaBildirimiPlani(?array $atama, int $islemKullaniciId): string
 /**
  * Atama degistiyse bildirimi tetikler, sonuc metnini dondurur.
  */
-function atamaBildirimiUygula(Database $db, int $ticketId, ?array $atama, int $islemKullaniciId): string
+function atamaBildirimiUygula(Database $db, int $ticketId, ?array $atama, int $islemKullaniciId, array $kendiIdler): string
 {
     if (!$atama || $atama['yeni'] <= 0) {
         return 'gonderilmedi';
     }
 
-    if ($atama['yeni'] === $atama['eski'] || $atama['yeni'] === $islemKullaniciId) {
+    if ($atama['yeni'] === $atama['eski'] || in_array($atama['yeni'], $kendiIdler, true)) {
         return 'gonderilmedi (kendine atama veya degisiklik yok)';
     }
 
@@ -465,7 +500,7 @@ function komutGuncelle(Database $db, int $ticketId, array $ajan, array $secenek)
             'uyari'       => 'ONIZLEME: hicbir kayit yazilmadi. Gondermek icin --onizleme bayragini kaldirin.',
             'degisen'     => $hazirlik['degisen'],
             'tickets_update' => $update,
-            'bildirim'    => atamaBildirimiPlani($hazirlik['atama'], $kullaniciId),
+            'bildirim'    => atamaBildirimiPlani($hazirlik['atama'], kendiKullaniciIdleri($ajan)),
             'islem_yapan' => $islemYapan,
         ];
     }
@@ -475,7 +510,7 @@ function komutGuncelle(Database $db, int $ticketId, array $ajan, array $secenek)
     return [
         'onizleme' => false,
         'degisen'  => $hazirlik['degisen'],
-        'bildirim' => atamaBildirimiUygula($db, $ticketId, $hazirlik['atama'], $kullaniciId),
+        'bildirim' => atamaBildirimiUygula($db, $ticketId, $hazirlik['atama'], $kullaniciId, kendiKullaniciIdleri($ajan)),
         'tarih'    => $now,
         'islem_yapan' => $islemYapan,
     ];
@@ -638,12 +673,92 @@ function metinOku(?string $yol, string $projeKoku): string
 }
 
 /**
+ * --ek-dosya seçeneğindeki dosyaları doğrular (virgülle birden fazla dosya verilebilir).
+ * Panel ile aynı kurallar: izinli MIME listesi, en fazla 10 MB.
+ */
+function ekDosyalariHazirla(?string $deger, string $projeKoku): array
+{
+    if (empty($deger)) {
+        return [];
+    }
+
+    $izinliMime = ['image/jpeg', 'image/png', 'image/gif', 'application/pdf',
+                   'application/msword', 'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
+                   'application/vnd.ms-excel', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+                   'text/plain'];
+
+    $ekler = [];
+    foreach (array_filter(array_map('trim', explode(',', $deger))) as $yol) {
+        $tamYol = $yol;
+        if (!is_file($tamYol)) {
+            $tamYol = $projeKoku . '/' . ltrim(str_replace('\\', '/', $yol), '/');
+        }
+        if (!is_file($tamYol)) {
+            throw new Exception("Ek dosya bulunamadi: {$yol}");
+        }
+
+        $mime = (string)mime_content_type($tamYol);
+        if (!in_array($mime, $izinliMime, true)) {
+            throw new Exception("Ek dosya turu izinli degil ({$mime}): {$yol}");
+        }
+
+        $boyut = (int)filesize($tamYol);
+        if ($boyut <= 0 || $boyut > 10 * 1024 * 1024) {
+            throw new Exception("Ek dosya boyutu gecersiz (en fazla 10 MB): {$yol}");
+        }
+
+        $ekler[] = ['yol' => $tamYol, 'ad' => basename($tamYol), 'mime' => $mime, 'boyut' => $boyut];
+    }
+
+    return $ekler;
+}
+
+/**
+ * Doğrulanmış ekleri ticket klasörüne kopyalar ve Ticket_Ekler'e mesaja bağlı kaydeder
+ */
+function ekDosyalariKaydet(Database $db, int $ticketId, int $mesajId, array $ekler, int $kullaniciId, string $now): array
+{
+    $uploadDir = __DIR__ . '/../../assets/uploads/tickets/' . $ticketId . '/';
+    if (!is_dir($uploadDir) && !mkdir($uploadDir, 0755, true) && !is_dir($uploadDir)) {
+        throw new Exception('Dosya klasoru olusturulamadi.');
+    }
+
+    $kayitlar = [];
+    foreach ($ekler as $ek) {
+        $ext = preg_replace('/[^a-z0-9]/', '', strtolower((string)pathinfo($ek['ad'], PATHINFO_EXTENSION)));
+        $guvenliAd = bin2hex(random_bytes(8)) . ($ext !== '' ? '.' . $ext : '');
+        if (!copy($ek['yol'], $uploadDir . $guvenliAd)) {
+            throw new Exception("Ek dosya kopyalanamadi: {$ek['ad']}");
+        }
+
+        $kayitlar[] = (int)$db->insert('Ticket_Ekler', [
+            'Ticket_Ekler_ticket_id'    => $ticketId,
+            'Ticket_Ekler_mesaj_id'     => $mesajId,
+            'Ticket_Ekler_dosya_adi'    => $ek['ad'],
+            'Ticket_Ekler_dosya_yolu'   => 'assets/uploads/tickets/' . $ticketId . '/' . $guvenliAd,
+            'Ticket_Ekler_dosya_boyutu' => $ek['boyut'],
+            'Ticket_Ekler_mime_turu'    => $ek['mime'],
+            'OlusturanKullanici'        => $kullaniciId,
+            'OlusturmaTarihi'           => $now,
+            'GuncelleyenKullanici'      => $kullaniciId,
+            'GuncellemeTarihi'          => $now,
+            'Durum'                     => 1,
+        ]);
+    }
+
+    return $kayitlar;
+}
+
+/**
  * yanit komutu: müşteri yanıtı ve/veya iç not ekler (panel davranışıyla birebir)
  */
-function komutYanit(Database $db, int $ticketId, array $ajan, string $mesajText, string $icNotText, array $secenek): array
+function komutYanit(Database $db, int $ticketId, array $ajan, string $mesajText, string $icNotText, array $secenek, array $ekler = []): array
 {
     if ($mesajText === '' && $icNotText === '') {
         throw new Exception('Mesaj veya ic not bos olamaz.');
+    }
+    if (!empty($ekler) && $mesajText === '') {
+        throw new Exception('Ek dosya yalnizca musteri yanitina eklenebilir (--mesaj-dosya gerekli).');
     }
 
     $ticket = $db->fetchOne(
@@ -658,7 +773,7 @@ function komutYanit(Database $db, int $ticketId, array $ajan, string $mesajText,
     $now = app_now();
     $sonuc = ['onizleme' => false, 'mesaj_id' => null, 'ic_not_id' => null];
 
-    // --atanan verilmediyse ve ticket kimseye atanmamissa, yaniti yazan kullaniciya atanir.
+    // --atanan verilmediyse ve ticket kimseye atanmamissa, ajanin sahibine atanir.
     // Ticket zaten birine atanmissa atamaya dokunulmaz. --atanan=bos ile bu davranis atlanabilir.
     $otomatikAtama = false;
     if (!isset($secenek['atanan']) || trim((string)$secenek['atanan']) === '') {
@@ -667,7 +782,7 @@ function komutYanit(Database $db, int $ticketId, array $ajan, string $mesajText,
             [$ticketId]
         );
         if ((int)($mevcut['Tickets_atanan_kullanici_id'] ?? 0) <= 0) {
-            $secenek['atanan'] = (string)$kullaniciId;
+            $secenek['atanan'] = (string)$ajan['sahip']['kullanici_id'];
             $otomatikAtama = true;
         }
     }
@@ -692,16 +807,17 @@ function komutYanit(Database $db, int $ticketId, array $ajan, string $mesajText,
             'uyari'    => 'ONIZLEME: hicbir kayit yazilmadi, bildirim gonderilmedi. Gondermek icin --onizleme bayragini kaldirin.',
             'yazan'    => trim($ajan['kullanici']['kullanici_ad'] . ' ' . ($ajan['kullanici']['kullanici_soyad'] ?? '')),
             'otomatik_atama' => $otomatikAtama
-                ? 'ticket atanmamisti, yaniti yazan kullaniciya atanacak'
+                ? 'ticket atanmamisti, ' . trim($ajan['sahip']['kullanici_ad'] . ' ' . ($ajan['sahip']['kullanici_soyad'] ?? '')) . ' kullanicisina atanacak'
                 : false,
             'musteri_yaniti' => $mesajText !== '' ? metinOzeti($mesajText) : null,
             'ic_not'         => $icNotText !== '' ? metinOzeti($icNotText) : null,
+            'ekler'          => array_map(fn($ek) => $ek['ad'] . ' (' . $ek['mime'] . ', ' . $ek['boyut'] . ' bayt)', $ekler),
             'degisen'        => $hazirlik['degisen'],
             'tickets_update' => $ticketUpdate,
             'bildirim'       => $mesajText !== ''
                 ? 'gonderilecek (yeni mesaj: mail/WhatsApp)'
                 : 'gonderilmeyecek (yalnizca ic not)',
-            'atama_bildirimi' => atamaBildirimiPlani($hazirlik['atama'], $kullaniciId),
+            'atama_bildirimi' => atamaBildirimiPlani($hazirlik['atama'], kendiKullaniciIdleri($ajan)),
         ];
     }
 
@@ -718,6 +834,10 @@ function komutYanit(Database $db, int $ticketId, array $ajan, string $mesajText,
             'GuncellemeTarihi'             => $now,
             'Durum'                        => 1,
         ]);
+
+        if (!empty($ekler)) {
+            $sonuc['ek_idler'] = ekDosyalariKaydet($db, $ticketId, $sonuc['mesaj_id'], $ekler, $kullaniciId, $now);
+        }
     }
 
     if ($icNotText !== '') {
@@ -753,7 +873,7 @@ function komutYanit(Database $db, int $ticketId, array $ajan, string $mesajText,
 
     $db->update('Tickets', $ticketUpdate, ['Tickets_id' => $ticketId]);
 
-    $sonuc['atama_bildirimi'] = atamaBildirimiUygula($db, $ticketId, $hazirlik['atama'], $kullaniciId);
+    $sonuc['atama_bildirimi'] = atamaBildirimiUygula($db, $ticketId, $hazirlik['atama'], $kullaniciId, kendiKullaniciIdleri($ajan));
 
     // Müşteriye yanıt gönderildiyse bildirim tetikle (mail/WhatsApp)
     if ($mesajText !== '') {
@@ -769,6 +889,251 @@ function komutYanit(Database $db, int $ticketId, array $ajan, string $mesajText,
     return $sonuc;
 }
 
+/**
+ * --proje degerini Ticket_Kaynak kaydina cevirir.
+ * Deger kaynak kodu (PORTAL) veya host (portal.ornekproje.com) olabilir.
+ */
+function projeKaynagiCoz(Database $db, ?string $deger): ?array
+{
+    if ($deger === null || trim($deger) === '') {
+        return null;
+    }
+
+    $deger = mb_strtolower(trim($deger), 'UTF-8');
+    $host  = parse_url(str_contains($deger, '://') ? $deger : 'https://' . $deger, PHP_URL_HOST) ?: $deger;
+
+    $kaynaklar = $db->fetchAll(
+        "SELECT Ticket_Kaynak_id, Ticket_Kaynak_kod, Ticket_Kaynak_ad, Ticket_Kaynak_api_url
+         FROM Ticket_Kaynak WHERE Durum = 1 ORDER BY Ticket_Kaynak_id"
+    ) ?: [];
+
+    $adaylar = [];
+    foreach ($kaynaklar as $k) {
+        if (mb_strtolower((string)$k['Ticket_Kaynak_kod'], 'UTF-8') === $deger) {
+            return $k;
+        }
+        $kHost = strtolower((string)parse_url((string)$k['Ticket_Kaynak_api_url'], PHP_URL_HOST));
+        if ($kHost !== '' && $kHost === $host) {
+            $adaylar[] = $k;
+        }
+    }
+
+    if (count($adaylar) === 1) {
+        return $adaylar[0];
+    }
+
+    $liste = implode(', ', array_map(
+        static fn($k) => $k['Ticket_Kaynak_kod'] . '=' . ($k['Ticket_Kaynak_api_url'] ?? '-'),
+        $adaylar ?: $kaynaklar
+    ));
+    $onEk = $adaylar ? 'Proje icin birden fazla kaynak (kod verin)' : 'Proje kaynagi bulunamadi';
+    throw new Exception("{$onEk}: '{$deger}'. Secenekler: {$liste}");
+}
+
+/**
+ * ara komutu: konu ve mesajlarda (ic notlar dahil) arar.
+ * Birden fazla kelime verilirse her kelime konu veya herhangi bir mesajda gecmelidir.
+ * Acik ve kapali tum ticket'lar doner (--durum=acik|kapali ile daraltilabilir).
+ */
+function komutAra(Database $db, string $ifade, array $secenek): array
+{
+    $kelimeler = array_values(array_filter(preg_split('/\s+/u', trim($ifade)) ?: [], static fn($k) => $k !== ''));
+    if (!$kelimeler) {
+        throw new Exception('Aranacak ifade verin. Ornek: ara "Hepsiburada key"');
+    }
+
+    $where  = ['t.Durum = 1'];
+    $params = [];
+
+    foreach ($kelimeler as $kelime) {
+        $kalip = '%' . str_replace(['[', '%', '_'], ['[[]', '[%]', '[_]'], $kelime) . '%';
+        $where[] = "(t.Tickets_konu LIKE ? OR EXISTS (
+                        SELECT 1 FROM Ticket_Mesajlar m
+                        WHERE m.Ticket_Mesajlar_ticket_id = t.Tickets_id AND m.Durum = 1
+                          AND m.Ticket_Mesajlar_mesaj LIKE ?))";
+        $params[] = $kalip;
+        $params[] = $kalip;
+    }
+
+    $proje = projeKaynagiCoz($db, $secenek['proje'] ?? null);
+    if ($proje) {
+        $where[]  = 't.Tickets_kaynak_id = ?';
+        $params[] = (int)$proje['Ticket_Kaynak_id'];
+    }
+
+    $durumFiltre = mb_strtolower(trim((string)($secenek['durum'] ?? 'hepsi')), 'UTF-8');
+    if ($durumFiltre === 'acik') {
+        $where[] = 'ISNULL(dur.Ticket_Durumlar_kapatma_durumu, 0) = 0';
+    } elseif ($durumFiltre === 'kapali') {
+        $where[] = 'dur.Ticket_Durumlar_kapatma_durumu = 1';
+    }
+
+    $limit = max(1, min(100, (int)($secenek['limit'] ?? 20)));
+
+    $satirlar = $db->fetchAll(
+        "SELECT TOP {$limit}
+            t.Tickets_id   AS id,
+            t.Tickets_no   AS no,
+            t.Tickets_konu AS konu,
+            dur.Ticket_Durumlar_ad AS durum,
+            CAST(ISNULL(dur.Ticket_Durumlar_kapatma_durumu, 0) AS INT) AS kapali,
+            kay.Ticket_Kaynak_kod AS proje,
+            LTRIM(RTRIM(ISNULL(at.kullanici_ad, '') + ' ' + ISNULL(at.kullanici_soyad, ''))) AS atanan,
+            CONVERT(VARCHAR(16), t.OlusturmaTarihi, 120) AS acilis,
+            CONVERT(VARCHAR(16), COALESCE(t.Tickets_son_yanit_tarihi, t.GuncellemeTarihi, t.OlusturmaTarihi), 120) AS son_hareket
+         FROM Tickets t
+         LEFT JOIN Ticket_Durumlar dur ON t.Tickets_durum_id  = dur.Ticket_Durumlar_id
+         LEFT JOIN Ticket_Kaynak   kay ON t.Tickets_kaynak_id = kay.Ticket_Kaynak_id
+         LEFT JOIN kullanicilar    at  ON t.Tickets_atanan_kullanici_id = at.kullanici_id
+         WHERE " . implode(' AND ', $where) . "
+         ORDER BY COALESCE(t.Tickets_son_yanit_tarihi, t.GuncellemeTarihi, t.OlusturmaTarihi) DESC",
+        $params
+    ) ?: [];
+
+    foreach ($satirlar as &$s) {
+        $s['eslesme'] = array_values(array_filter($kelimeler, static fn($k) => mb_stripos((string)$s['konu'], $k, 0, 'UTF-8') !== false))
+            ? 'konu' : 'mesaj';
+        $s['kapali'] = (bool)$s['kapali'];
+    }
+    unset($s);
+
+    return [
+        'ifade'    => $ifade,
+        'proje'    => $proje['Ticket_Kaynak_kod'] ?? null,
+        'durum'    => $durumFiltre,
+        'adet'     => count($satirlar),
+        'limit'    => $limit,
+        'ticketlar' => $satirlar,
+    ];
+}
+
+/**
+ * Verilmeyen kategori/oncelik icin varsayilan tanim (sira olarak ilk aktif kayit, ya da ada gore).
+ */
+function tanimVarsayilan(Database $db, string $tablo, string $onek, ?string $deger, string $varsayilanAd, string $etiket): array
+{
+    $sonuc = tanimCoz($db, $tablo, $onek, $deger, $etiket);
+    if ($sonuc) {
+        return $sonuc;
+    }
+
+    try {
+        $sonuc = tanimCoz($db, $tablo, $onek, $varsayilanAd, $etiket);
+    } catch (Exception $e) {
+        $sonuc = null;
+    }
+    if ($sonuc) {
+        return $sonuc;
+    }
+
+    $ilk = $db->fetchOne("SELECT TOP 1 * FROM {$tablo} WHERE Durum = 1 ORDER BY {$onek}_sira");
+    if (!$ilk) {
+        throw new Exception("{$etiket} tanimi bulunamadi (aktif kayit yok).");
+    }
+    return ['id' => (int)$ilk[$onek . '_id'], 'ad' => (string)$ilk[$onek . '_ad'], 'satir' => $ilk];
+}
+
+/**
+ * ac komutu: yeni ticket acar (panel/TicketService ile ayni akis).
+ * Ilk mesaj --mesaj-dosya, istege bagli ilk iç not --icnot-dosya.
+ * --atanan verilmezse ticket ajanin sahibine (ben) atanir; --durum verilirse acilistan sonra uygulanir.
+ */
+function komutAc(Database $db, array $ajan, string $konu, string $mesajText, string $icNotText, array $secenek): array
+{
+    $konu = trim($konu);
+    if ($konu === '') {
+        throw new Exception('Konu bos olamaz (--konu="...").');
+    }
+    if (mb_strlen($konu, 'UTF-8') > 200) {
+        throw new Exception('Konu en fazla 200 karakter olabilir.');
+    }
+    if ($mesajText === '') {
+        throw new Exception('Ilk mesaj bos olamaz (--mesaj-dosya=...).');
+    }
+
+    $kategori = tanimVarsayilan($db, 'Ticket_Kategoriler', 'Ticket_Kategoriler', $secenek['kategori'] ?? null, 'Genel', 'Kategori');
+    $oncelik  = tanimVarsayilan($db, 'Ticket_Oncelikler', 'Ticket_Oncelikler', $secenek['oncelik'] ?? null, 'Normal', 'Oncelik');
+    $durum    = tanimCoz($db, 'Ticket_Durumlar', 'Ticket_Durumlar', $secenek['durum'] ?? null, 'Durum');
+    $proje    = projeKaynagiCoz($db, $secenek['proje'] ?? null);
+
+    $atananId = atananCoz($db, ($secenek['atanan'] ?? '') !== '' ? $secenek['atanan'] : 'ben', $ajan);
+
+    // Ayni konuyla acik ticket varsa yenisi acilmaz (mevcut ticket'a yanit yazilmali)
+    $mukerrer = $db->fetchAll(
+        "SELECT t.Tickets_id AS id, t.Tickets_no AS no, dur.Ticket_Durumlar_ad AS durum
+         FROM Tickets t
+         LEFT JOIN Ticket_Durumlar dur ON t.Tickets_durum_id = dur.Ticket_Durumlar_id
+         WHERE t.Durum = 1 AND t.Tickets_konu = ?",
+        [$konu]
+    ) ?: [];
+    if ($mukerrer && empty($secenek['zorla'])) {
+        throw new Exception('Ayni konulu ticket zaten var: ' . implode(', ', array_map(
+            static fn($r) => '#' . $r['id'] . ' ' . $r['no'] . ' (' . $r['durum'] . ')', $mukerrer
+        )) . '. Yeni kayit icin "yanit" komutunu kullanin (yine de acmak icin --zorla).');
+    }
+
+    $kullaniciId = (int)$ajan['kullanici']['kullanici_id'];
+    $yazan = trim($ajan['kullanici']['kullanici_ad'] . ' ' . ($ajan['kullanici']['kullanici_soyad'] ?? ''));
+    $atananAd = null;
+    if ($atananId) {
+        $r = $db->fetchOne("SELECT kullanici_ad, kullanici_soyad FROM kullanicilar WHERE kullanici_id = ?", [$atananId]);
+        $atananAd = trim(($r['kullanici_ad'] ?? '') . ' ' . ($r['kullanici_soyad'] ?? ''));
+    }
+
+    $plan = [
+        'konu'     => $konu,
+        'proje'    => $proje ? $proje['Ticket_Kaynak_kod'] . ' (' . ($proje['Ticket_Kaynak_api_url'] ?? '-') . ')' : null,
+        'kategori' => $kategori['ad'],
+        'oncelik'  => $oncelik['ad'],
+        'durum'    => $durum['ad'] ?? 'ilk acik durum',
+        'atanan'   => $atananAd,
+        'acan'     => $yazan,
+        'ilk_mesaj' => metinOzeti($mesajText),
+        'ic_not'   => $icNotText !== '' ? metinOzeti($icNotText) : null,
+    ];
+
+    if (onizlemeMi($secenek)) {
+        return [
+            'onizleme' => true,
+            'uyari'    => 'ONIZLEME: ticket acilmadi, bildirim gonderilmedi. Acmak icin --onizleme bayragini kaldirin.',
+            'plan'     => $plan,
+            'bildirim' => 'yeni_ticket bildirimi tetiklenecek (bildirim kurallarina gore)',
+        ];
+    }
+
+    $service = new TicketService($db);
+    $olustur = $service->ticketOlustur([
+        'konu'                   => $konu,
+        'mesaj'                  => $mesajText,
+        'kategori_id'            => $kategori['id'],
+        'oncelik_id'             => $oncelik['id'],
+        'atanan_id'              => $atananId ?: null,
+        'olusturan_kullanici_id' => $kullaniciId,
+        'islem_kullanici_id'     => $kullaniciId,
+        'kaynak_id'              => $proje ? (int)$proje['Ticket_Kaynak_id'] : null,
+        'mesaj_kaynak'           => 'panel',
+    ]);
+    $ticketId = (int)$olustur['ticket_id'];
+
+    $sonuc = ['onizleme' => false, 'ticket_id' => $ticketId, 'ticket_no' => $olustur['ticket_no'], 'plan' => $plan];
+
+    // Ilk iç not ve durum: yanit komutuyla ayni akis (iç notta bildirim gitmez)
+    if ($icNotText !== '' || $durum) {
+        $ek = ['atanan' => (string)($atananId ?: 'bos')];
+        if ($durum) {
+            $ek['durum'] = (string)$durum['id'];
+        }
+        if ($icNotText !== '') {
+            $sonuc['ic_not'] = komutYanit($db, $ticketId, $ajan, '', $icNotText, $ek);
+        } else {
+            $sonuc['guncelle'] = komutGuncelle($db, $ticketId, $ajan, $ek);
+        }
+    }
+
+    $sonuc['link'] = 'https://destek.ornekproje.com/admin/ticket-detay?id=' . $ticketId;
+    return $sonuc;
+}
+
 // ─────────────────────────────────────────────────────────────
 // Giriş noktası
 // ─────────────────────────────────────────────────────────────
@@ -780,11 +1145,36 @@ try {
     if ($komut === '' || $komut === 'yardim') {
         echo "Kullanim:\n";
         echo "  php admin/cron/ticket-ajan.php detay <id|url>\n";
-        echo "  php admin/cron/ticket-ajan.php yanit <id|url> --mesaj-dosya=... --icnot-dosya=... [--durum=] [--oncelik=] [--atanan=]\n";
+        echo "  php admin/cron/ticket-ajan.php yanit <id|url> --mesaj-dosya=... --icnot-dosya=... [--ek-dosya=a.png,b.pdf] [--durum=] [--oncelik=] [--atanan=]\n";
         echo "  php admin/cron/ticket-ajan.php guncelle <id|url> [--durum=] [--oncelik=] [--kategori=] [--atanan=]\n";
+        echo "  php admin/cron/ticket-ajan.php ara \"<ifade>\" [--proje=KOD|host] [--durum=acik|kapali|hepsi] [--limit=20]\n";
+        echo "  php admin/cron/ticket-ajan.php ac --konu=\"...\" --mesaj-dosya=... [--icnot-dosya=...] [--proje=KOD|host] [--kategori=] [--oncelik=] [--durum=] [--atanan=] [--zorla]\n";
         echo "\n  --durum/--oncelik/--kategori: ID veya tanim adi (ornek: --durum=Cozuldu)\n";
-        echo "  --atanan: kullanici_id, ad soyad, ben (kaynak kullanicisi) veya bos\n";
+        echo "  --atanan: kullanici_id, ad soyad, ben (BATUHAN kaynagi), ajan (yaniti yazan hesap) veya bos\n";
+        echo "  --kaynak: yaniti yazacak kaynak kodu (varsayilan: AI)\n";
         echo "  --onizleme: hicbir kayit yazilmaz, yalnizca yapilacak islem raporlanir (taslak)\n";
+        exit(0);
+    }
+
+    $db = Database::getInstance();
+    $projeKoku = str_replace('\\', '/', realpath(__DIR__ . '/../..'));
+
+    // Ticket id gerektirmeyen komutlar
+    if ($komut === 'ara') {
+        $ifade = trim(implode(' ', array_slice($args['konumsal'], 1)));
+        $sonuc = komutAra($db, $ifade, $args['secenek']);
+        echo json_encode(['success' => true, 'data' => $sonuc], JSON_UNESCAPED_UNICODE | JSON_PRETTY_PRINT), PHP_EOL;
+        exit(0);
+    }
+
+    if ($komut === 'ac') {
+        $kaynakKod = strtoupper($args['secenek']['kaynak'] ?? AJAN_VARSAYILAN_KAYNAK);
+        $ajan = ajanGetir($db, $kaynakKod, AJAN_SAHIP_KAYNAK);
+
+        $mesajText = metinOku($args['secenek']['mesaj-dosya'] ?? null, $projeKoku);
+        $icNotText = metinOku($args['secenek']['icnot-dosya'] ?? null, $projeKoku);
+        $sonuc = komutAc($db, $ajan, (string)($args['secenek']['konu'] ?? ''), $mesajText, $icNotText, $args['secenek']);
+        echo json_encode(['success' => true, 'data' => $sonuc], JSON_UNESCAPED_UNICODE | JSON_PRETTY_PRINT), PHP_EOL;
         exit(0);
     }
 
@@ -792,9 +1182,6 @@ try {
     if ($ticketId <= 0) {
         throw new Exception('Gecerli bir ticket id veya ticket-detay linki verin.');
     }
-
-    $db = Database::getInstance();
-    $projeKoku = str_replace('\\', '/', realpath(__DIR__ . '/../..'));
     // vhost kökü: <kok>/<domain>/<subdomain>/admin/cron -> 4 seviye yukarı
     $vhostRoot = $args['secenek']['vhost-root'] ?? (realpath(__DIR__ . '/../../../..') ?: '');
 
@@ -806,18 +1193,19 @@ try {
 
     if ($komut === 'yanit') {
         $kaynakKod = strtoupper($args['secenek']['kaynak'] ?? AJAN_VARSAYILAN_KAYNAK);
-        $ajan = ajanKaynagiGetir($db, $kaynakKod);
+        $ajan = ajanGetir($db, $kaynakKod, AJAN_SAHIP_KAYNAK);
 
         $mesajText = metinOku($args['secenek']['mesaj-dosya'] ?? null, $projeKoku);
         $icNotText = metinOku($args['secenek']['icnot-dosya'] ?? null, $projeKoku);
-        $sonuc = komutYanit($db, $ticketId, $ajan, $mesajText, $icNotText, $args['secenek']);
+        $ekler = ekDosyalariHazirla($args['secenek']['ek-dosya'] ?? null, $projeKoku);
+        $sonuc = komutYanit($db, $ticketId, $ajan, $mesajText, $icNotText, $args['secenek'], $ekler);
         echo json_encode(['success' => true, 'data' => $sonuc], JSON_UNESCAPED_UNICODE | JSON_PRETTY_PRINT), PHP_EOL;
         exit(0);
     }
 
     if ($komut === 'guncelle') {
         $kaynakKod = strtoupper($args['secenek']['kaynak'] ?? AJAN_VARSAYILAN_KAYNAK);
-        $ajan = ajanKaynagiGetir($db, $kaynakKod);
+        $ajan = ajanGetir($db, $kaynakKod, AJAN_SAHIP_KAYNAK);
 
         $sonuc = komutGuncelle($db, $ticketId, $ajan, $args['secenek']);
         echo json_encode(['success' => true, 'data' => $sonuc], JSON_UNESCAPED_UNICODE | JSON_PRETTY_PRINT), PHP_EOL;

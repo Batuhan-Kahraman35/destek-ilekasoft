@@ -91,7 +91,7 @@ $departmanlar = $db->fetchAll("SELECT departman_id, departman_adi FROM kullanici
 // AJAX işlemleri
 /**
  * Telefonu ne girilirse girilsin 90XXXXXXXXXX formatina cevirir.
- * Ornek: "0501 357 10 85" / "+90 501 357 1085" / "5013571085" -> "905013571085"
+ * Ornek: "0500 000 00 00" / "+90 500 000 0000" / "5000000000" -> "905000000000"
  */
 if (!function_exists('personelTelefonNormalize')) {
     function personelTelefonNormalize(?string $telefon): string
