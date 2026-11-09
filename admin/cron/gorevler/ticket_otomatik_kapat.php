@@ -2,15 +2,18 @@
 /**
  * Görev: ticket_otomatik_kapat
  *
- * Belirtilen süre boyunca müşteri tarafından yanıtlanmayan destek taleplerini
- * otomatik olarak kapatır. Son mesajı panelden atılmış ve iç not olmayan
- * (yani müşteriye gönderilmiş bir yanıt olan) talepler kapatılır.
+ * Belirtilen süre boyunca hareketsiz kalan destek taleplerini otomatik kapatır.
  *
- * Parametreler (hepsi zamanlayıcıdan seçilir, kodda sabit değer yoktur):
- *   saat             number       Kaç saat yanıt beklenecek
- *   hedef_durumlar   multiselect  Yalnızca bu durumlardaki talepler kapatılır (boş = tüm açık durumlar)
- *   kapanis_durum_id select       Talebin çekileceği durum (boş = ilk kapatma durumu)
- *   mesaj_sablon_id  select       Ticket'a eklenecek mesaj şablonu (boş = CronAyarlar'daki metin)
+ * Hangi durumların kapatılacağı Ticket Tanımları > Durum sekmesinden yönetilir
+ * (Ticket_Durumlar tablosu, iki bayrak; iç notlar "son yanıt" sayılmaz):
+ *   Ticket_Durumlar_otokapat_son_biz      Son yanıt bizdeyse (panel) kapat
+ *   Ticket_Durumlar_otokapat_son_musteri  Son yanıt müşterideyse kapat
+ *   İkisi birden açıksa son yanıta bakılmaz, ikisi de kapalıysa durum taranmaz.
+ *
+ * Parametreler (zamanlayıcıdan seçilir, kodda sabit değer yoktur):
+ *   saat             number  Kaç saat yanıt beklenecek
+ *   kapanis_durum_id select  Talebin çekileceği durum (boş = ilk kapatma durumu)
+ *   mesaj_sablon_id  select  Ticket'a eklenecek mesaj şablonu (boş = CronAyarlar'daki metin)
  */
 
 require_once __DIR__ . '/../../includes/TicketService.php';
@@ -93,39 +96,55 @@ function gorev_ticket_otomatik_kapat(array $params, $db): array
         $kapanisDurumAd = (string)$varsayilan['Ticket_Durumlar_ad'];
     }
 
-    /* --- Hedef durumlar ------------------------------------------------ */
-    $hedefDurumlar = $params['hedef_durumlar'] ?? [];
-    if (is_string($hedefDurumlar)) {
-        $hedefDurumlar = $hedefDurumlar === '' ? [] : explode(',', $hedefDurumlar);
+    /* --- Hedef durumlar (Ticket Tanımları > Durum) ---------------------- */
+    $durumSatirlari = $db->fetchAll("
+        SELECT Ticket_Durumlar_id, Ticket_Durumlar_ad,
+               Ticket_Durumlar_otokapat_son_biz, Ticket_Durumlar_otokapat_son_musteri
+        FROM dbo.Ticket_Durumlar
+        WHERE Durum = 1
+          AND Ticket_Durumlar_kapatma_durumu = 0
+          AND (Ticket_Durumlar_otokapat_son_biz = 1 OR Ticket_Durumlar_otokapat_son_musteri = 1)
+        ORDER BY Ticket_Durumlar_sira
+    ");
+
+    // durum_id => ['biz' => bool, 'musteri' => bool]
+    $kurallar = [];
+    foreach ($durumSatirlari as $d) {
+        $kurallar[(int)$d['Ticket_Durumlar_id']] = [
+            'ad'      => (string)$d['Ticket_Durumlar_ad'],
+            'biz'     => (int)$d['Ticket_Durumlar_otokapat_son_biz'] === 1,
+            'musteri' => (int)$d['Ticket_Durumlar_otokapat_son_musteri'] === 1,
+        ];
     }
-    $hedefDurumlar = array_values(array_filter(array_map('intval', (array)$hedefDurumlar)));
-
-    $durumKosulu = '';
-    $sorguParams = [$saat];
-
-    if ($hedefDurumlar) {
-        $durumKosulu = ' AND t.Tickets_durum_id IN (' . implode(',', array_fill(0, count($hedefDurumlar), '?')) . ')';
-        $sorguParams = array_merge($sorguParams, $hedefDurumlar);
-    }
-
-    // Hedef durum secilmisse bu, "bu durumdakiler kosulsuz kapansin" iradesidir;
-    // son mesaji kimin yazdigina bakilmaz. Secim yapilmamissa (tum acik durumlar
-    // taranirken) yalnizca son yaniti biz vermissek kapatilir - aksi halde
-    // musterinin cevaplanmamis sorusu kendi ihmalimiz yuzunden kapatilir.
-    $sonMesajKontrolu = empty($hedefDurumlar);
 
     echo "Bekleme suresi   : {$saat} saat\n";
     echo "Kapanis durumu   : {$kapanisDurumAd} (#{$kapanisDurumId})\n";
-    echo "Hedef durumlar   : " . ($hedefDurumlar ? implode(', ', $hedefDurumlar) : 'tum acik durumlar') . "\n";
-    echo "Kapatma kurali   : " . ($sonMesajKontrolu ? 'yalnizca son yanit bizdense' : 'son yazan kim olursa olsun') . "\n";
-    echo "Mesaj kaynagi    : {$mesajKaynak}\n\n";
+    echo "Mesaj kaynagi    : {$mesajKaynak}\n";
+    echo "Hedef durumlar   :\n";
+    foreach ($kurallar as $id => $k) {
+        $kural = $k['biz'] && $k['musteri'] ? 'kosulsuz' : ($k['biz'] ? 'son yanit bizdeyse' : 'son yanit musterideyse');
+        echo "  - {$k['ad']} (#{$id}): {$kural}\n";
+    }
+    echo "\n";
+
+    if (!$kurallar) {
+        return [
+            'durum' => 1,
+            'sonuc' => 'Otomatik kapatma acik durum yok (Ticket Tanimlari > Durum).',
+            'cikti' => ob_get_clean(),
+        ];
+    }
+
+    $durumIdleri = array_keys($kurallar);
+    $durumKosulu = ' AND t.Tickets_durum_id IN (' . implode(',', array_fill(0, count($durumIdleri), '?')) . ')';
+    $sorguParams = array_merge([$saat], $durumIdleri);
 
     /* --- Aday talepler -------------------------------------------------- */
     // Referans tarih kademeli secilir: Tickets_son_yanit_tarihi eski kayitlarda NULL
     // olabiliyor; NULL bir tarih hicbir karsilastirmayi gecmedigi icin o talepler
     // sessizce elenirdi. Sirasiyla son yanit -> son musteri mesaji -> talep acilisi.
     $tickets = $db->fetchAll("
-        SELECT t.Tickets_id
+        SELECT t.Tickets_id, t.Tickets_durum_id
         FROM Tickets t
         INNER JOIN Ticket_Durumlar d ON t.Tickets_durum_id = d.Ticket_Durumlar_id
         WHERE d.Ticket_Durumlar_kapatma_durumu = 0
@@ -158,8 +177,10 @@ function gorev_ticket_otomatik_kapat(array $params, $db): array
 
     foreach ($tickets as $ticket) {
         $ticketId = (int)$ticket['Tickets_id'];
+        $kural    = $kurallar[(int)$ticket['Tickets_durum_id']];
 
-        if ($sonMesajKontrolu) {
+        // İki bayrak da açıksa son yanıtı kimin yazdığı önemsizdir
+        if (!($kural['biz'] && $kural['musteri'])) {
             // Konuşan tarafı belirlerken iç notlar hariç tutulur: iç not müşteriye
             // gitmez, dolayısıyla "son sözü kim söyledi" sorusunu etkilememelidir.
             // Aynı saniyeye denk gelen iki mesajda doğru olanı seçmek için Id ile ikinci sıralama.
@@ -172,8 +193,11 @@ function gorev_ticket_otomatik_kapat(array $params, $db): array
                 ORDER BY OlusturmaTarihi DESC, Ticket_Mesajlar_id DESC
             ", [$ticketId]);
 
-            // Müşteriye giden son mesaj panelden atılmışsa (top müşteride) kapat
-            if (!$sonMesaj || trim((string)$sonMesaj['Ticket_Mesajlar_kaynak']) !== 'panel') {
+            // panel = bizim yanıtımız, diğer kaynaklar (api vb.) müşteri
+            $sonBiz = $sonMesaj && trim((string)$sonMesaj['Ticket_Mesajlar_kaynak']) === 'panel';
+            $uygun  = $sonMesaj && ($sonBiz ? $kural['biz'] : $kural['musteri']);
+
+            if (!$uygun) {
                 $atlama++;
                 continue;
             }
@@ -202,7 +226,7 @@ function gorev_ticket_otomatik_kapat(array $params, $db): array
         $sayac++;
     }
 
-    echo "Atlanan (son yanit musteriden): {$atlama}\n";
+    echo "Atlanan (son yanit kurala uymuyor): {$atlama}\n";
     echo "[OK] {$sayac} talep otomatik kapatildi.\n";
 
     return [

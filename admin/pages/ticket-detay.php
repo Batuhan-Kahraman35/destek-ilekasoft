@@ -693,9 +693,16 @@ if ($isAdmin) {
                         <small class="text-muted ticket-no-header" id="ticket-no-baslik"></small>
                     </div>
                     <div class="col-sm-6 d-flex flex-column align-items-end gap-1">
-                        <a href="/admin/ticket-liste" class="btn btn-secondary btn-sm">
-                            <i class="bi bi-arrow-left me-1"></i> Listeye Dön
-                        </a>
+                        <div class="d-flex gap-1">
+                            <?php if ($isAdmin): ?>
+                            <a href="/admin/ai-asistan?id=<?= (int)$ticketId ?>" class="btn btn-outline-primary btn-sm">
+                                <i class="bi bi-robot me-1"></i> AI Asistan
+                            </a>
+                            <?php endif; ?>
+                            <a href="/admin/ticket-liste" class="btn btn-secondary btn-sm">
+                                <i class="bi bi-arrow-left me-1"></i> Listeye Dön
+                            </a>
+                        </div>
                         <ol class="breadcrumb mb-0">
                             <?php if ($menuAdi): ?>
                             <li class="breadcrumb-item"><?= htmlspecialchars($menuAdi) ?></li>

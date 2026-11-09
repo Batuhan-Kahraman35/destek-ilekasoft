@@ -35,6 +35,20 @@ $menuAdi   = $pageInfo['menu_adi']           ?? null;
 $siteAyarlari = $db->fetchOne("SELECT TOP 1 site_ayarlari_site_title FROM dbo.tanim_site_ayarlari ORDER BY site_ayarlari_id DESC");
 $siteTitle    = $siteAyarlari['site_ayarlari_site_title'] ?? 'Örnek Yazılım Portal';
 
+/**
+ * Durum kaydının kapatma alanları. Talebi zaten kapatan bir durum otomatik
+ * kapatmaya aday olamaz; bu yüzden o durumda iki otomatik kapatma bayrağı sıfırlanır.
+ */
+function durumKapatmaAlanlari(string $prefix): array
+{
+    $kapatir = intval($_POST['kapatma_durumu'] ?? 0) === 1;
+    return [
+        "{$prefix}_kapatma_durumu"       => $kapatir ? 1 : 0,
+        "{$prefix}_otokapat_son_biz"     => !$kapatir && intval($_POST['otokapat_son_biz'] ?? 0) === 1 ? 1 : 0,
+        "{$prefix}_otokapat_son_musteri" => !$kapatir && intval($_POST['otokapat_son_musteri'] ?? 0) === 1 ? 1 : 0,
+    ];
+}
+
 // =====================================================================
 // AJAX İşlemleri
 // =====================================================================
@@ -120,8 +134,8 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             if ($tip === 'kategori') $data["{$prefix}_aciklama"] = trim($_POST['aciklama'] ?? '');
             if ($tip === 'oncelik')  $data["{$prefix}_ikon"]     = $ikon ?: 'bi bi-dash-circle';
             if ($tip === 'durum') {
-                $data["{$prefix}_ikon"]           = $ikon ?: 'bi bi-circle';
-                $data["{$prefix}_kapatma_durumu"] = intval($_POST['kapatma_durumu'] ?? 0);
+                $data["{$prefix}_ikon"] = $ikon ?: 'bi bi-circle';
+                $data = array_merge($data, durumKapatmaAlanlari($prefix));
             }
             if ($tip === 'bildirim_yolu') $data["{$prefix}_ikon"] = $ikon ?: 'bi bi-circle';
 
@@ -154,8 +168,8 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             if ($tip === 'kategori') $data["{$prefix}_aciklama"] = trim($_POST['aciklama'] ?? '');
             if ($tip === 'oncelik')  $data["{$prefix}_ikon"]     = $ikon ?: 'bi bi-dash-circle';
             if ($tip === 'durum') {
-                $data["{$prefix}_ikon"]           = $ikon ?: 'bi bi-circle';
-                $data["{$prefix}_kapatma_durumu"] = intval($_POST['kapatma_durumu'] ?? 0);
+                $data["{$prefix}_ikon"] = $ikon ?: 'bi bi-circle';
+                $data = array_merge($data, durumKapatmaAlanlari($prefix));
             }
             if ($tip === 'bildirim_yolu') $data["{$prefix}_ikon"] = $ikon ?: 'bi bi-circle';
 
@@ -318,6 +332,14 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                                         <option value="0">Kapatmaz</option>
                                     </select>
                                 </div>
+                                <div class="col-12 col-md-4 filtre-kapatma" style="display:none">
+                                    <label class="form-label">Otomatik Kapatma</label>
+                                    <select id="filtre-otokapat" class="form-select select2-basic">
+                                        <option value="">Tümü</option>
+                                        <option value="1">Otomatik kapatılır</option>
+                                        <option value="0">Otomatik kapatılmaz</option>
+                                    </select>
+                                </div>
                             </div>
                             <div class="mt-3 d-flex gap-2">
                                 <button class="btn btn-primary btn-sm" id="btnFiltrele">
@@ -371,6 +393,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                                     <th>Renk</th>
                                     <th>Sıra</th>
                                     <th>Kapatma</th>
+                                    <th>Oto. Kapatma</th>
                                     <th>Kullanım</th>
                                     <th>İşlemler</th>
                                 </tr>
@@ -449,6 +472,25 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                         </label>
                     </div>
                 </div>
+
+                <!-- Durum'a özel: Otomatik kapatma (cron: ticket_otomatik_kapat) -->
+                <div class="mb-1 alan-kapatma alan-otokapat" style="display:none">
+                    <label class="form-label mb-1">Otomatik Kapatma</label>
+                    <div class="form-check form-switch">
+                        <input class="form-check-input" type="checkbox" role="switch" id="form-otokapat-biz" name="otokapat_son_biz" value="1">
+                        <label class="form-check-label" for="form-otokapat-biz">Son yanıt bizdeyse kapat</label>
+                    </div>
+                    <div class="form-check form-switch">
+                        <input class="form-check-input" type="checkbox" role="switch" id="form-otokapat-musteri" name="otokapat_son_musteri" value="1">
+                        <label class="form-check-label" for="form-otokapat-musteri">Son yanıt müşterideyse kapat</label>
+                    </div>
+                    <div class="form-text">
+                        Bekleme süresi, kapanış durumu ve mesaj Cron Yönetimi › <code>ticket_otomatik_kapat</code> zamanlayıcısından ayarlanır. İç notlar son yanıt sayılmaz.
+                    </div>
+                    <div class="form-text text-danger otokapat-uyari" style="display:none">
+                        <i class="bi bi-exclamation-triangle me-1"></i>Müşterinin cevaplanmamış sorusu olan talepler de kapatılır.
+                    </div>
+                </div>
             </div>
             <div class="modal-footer">
                 <button type="button" class="btn btn-secondary btn-sm" data-bs-dismiss="modal">İptal</button>
@@ -481,7 +523,15 @@ const TIPLER = {
 };
 
 // Kolon sırası (thead ile birebir aynı olmalı)
-const KOLON = { onizleme: 0, ad: 1, aciklama: 2, ikon: 3, renk: 4, sira: 5, kapatma: 6, kullanim: 7, islem: 8 };
+const KOLON = { onizleme: 0, ad: 1, aciklama: 2, ikon: 3, renk: 4, sira: 5, kapatma: 6, otokapat: 7, kullanim: 8, islem: 9 };
+
+// Otomatik kapatma bayraklarının (son yanıt biz / müşteri) tablodaki karşılığı
+function otokapatRozet(biz, musteri) {
+    if (biz && musteri) return '<span class="badge text-bg-danger" data-otokapat="1">Koşulsuz</span>';
+    if (biz)            return '<span class="badge text-bg-info" data-otokapat="1">Son yanıt bizdeyse</span>';
+    if (musteri)        return '<span class="badge text-bg-warning" data-otokapat="1">Son yanıt müşterideyse</span>';
+    return '<span class="text-muted">-</span>';
+}
 
 let satirCache = {};   // id -> satır verisi (inline onclick yerine)
 
@@ -507,7 +557,7 @@ $(document).ready(function () {
         columnDefs: [
             { targets: [KOLON.onizleme, KOLON.renk, KOLON.islem], orderable: false },
             { targets: KOLON.islem, className: 'text-center' },
-            { targets: [KOLON.kapatma, KOLON.kullanim], className: 'text-center' }
+            { targets: [KOLON.kapatma, KOLON.otokapat, KOLON.kullanim], className: 'text-center' }
         ]
     });
 
@@ -532,7 +582,7 @@ $(document).ready(function () {
     $('#filtre-ad').on('keyup', function (e) { if (e.key === 'Enter') tanimDT.draw(); });
     $('#btnFiltreTemizle').on('click', function () {
         $('#filtre-ad').val('');
-        $('#filtre-kullanim, #filtre-kapatma').val('').trigger('change');
+        $('#filtre-kullanim, #filtre-kapatma, #filtre-otokapat').val('').trigger('change');
         tanimDT.draw();
     });
 
@@ -563,6 +613,7 @@ $(document).ready(function () {
         if (/^#[0-9a-fA-F]{3,8}$/.test(v)) { $('#form-renk').val(v); onizlemeTazele(); }
     });
     $('#form-ad, #form-ikon').on('input', onizlemeTazele);
+    $('#form-kapatma, #form-otokapat-musteri').on('change', otokapatAlanTazele);
 
     // Modal kaydet
     $('#btnModalKaydet').on('click', kaydet);
@@ -582,10 +633,11 @@ function tipDegistir(tip) {
     tanimDT.column(KOLON.aciklama).visible(bilgi.aciklamaVar, false);
     tanimDT.column(KOLON.ikon).visible(bilgi.ikonVar, false);
     tanimDT.column(KOLON.kapatma).visible(bilgi.kapatmaVar, false);
+    tanimDT.column(KOLON.otokapat).visible(bilgi.kapatmaVar, false);
 
-    // Kapatma filtresi yalnızca durum sekmesinde anlamlı
+    // Kapatma filtreleri yalnızca durum sekmesinde anlamlı
     $('.filtre-kapatma').toggle(bilgi.kapatmaVar);
-    if (!bilgi.kapatmaVar) $('#filtre-kapatma').val('').trigger('change');
+    if (!bilgi.kapatmaVar) $('#filtre-kapatma, #filtre-otokapat').val('').trigger('change');
 
     loadListe();
 }
@@ -642,6 +694,7 @@ function loadListe() {
                 `<span class="renk-onizleme" style="background:${escHtml(renk)}"></span> <span class="renk-kod text-muted">${escHtml(renk)}</span>`,
                 sira,
                 kapatir ? '<span class="badge text-bg-warning">Kapatır</span>' : '<span class="text-muted">-</span>',
+                otokapatRozet(row[prefix + '_otokapat_son_biz'] == 1, row[prefix + '_otokapat_son_musteri'] == 1),
                 kullanim > 0
                     ? `<span class="badge text-bg-secondary">${kullanim}</span>`
                     : '<span class="badge text-bg-light text-muted">0</span>',
@@ -681,6 +734,13 @@ $.fn.dataTable.ext.search.push(function (settings, veri, satirIndex, satirVerisi
         if (kapatir !== kapatmaFiltre) return false;
     }
 
+    const otokapatFiltre = $('#filtre-otokapat').val();
+    if (otokapatFiltre !== '' && otokapatFiltre !== undefined && TIPLER[aktifTip].kapatmaVar) {
+        // Arama verisi HTML'den arındırılmış olduğu için ham satır verisine bakılır
+        const otokapat = String(satirVerisi[KOLON.otokapat]).indexOf('data-otokapat') !== -1 ? '1' : '0';
+        if (otokapat !== otokapatFiltre) return false;
+    }
+
     return true;
 });
 
@@ -692,7 +752,16 @@ function modalAlanlarGoster(tip) {
     $('.alan-aciklama').toggle(bilgi.aciklamaVar);
     $('.alan-ikon').toggle(bilgi.ikonVar);
     $('.alan-kapatma').toggle(bilgi.kapatmaVar);
+    otokapatAlanTazele();
     onizlemeTazele();
+}
+
+// Talebi zaten kapatan durum otomatik kapatmaya aday olamaz
+function otokapatAlanTazele() {
+    const kapatir = $('#form-kapatma').is(':checked');
+    $('#form-otokapat-biz, #form-otokapat-musteri').prop('disabled', kapatir);
+    if (kapatir) $('#form-otokapat-biz, #form-otokapat-musteri').prop('checked', false);
+    $('.otokapat-uyari').toggle($('#form-otokapat-musteri').is(':checked'));
 }
 
 function onizlemeTazele() {
@@ -718,6 +787,7 @@ function formTemizle() {
     $('#form-aciklama').val('');
     $('#form-ikon').val('');
     $('#form-kapatma').prop('checked', false);
+    $('#form-otokapat-biz, #form-otokapat-musteri').prop('checked', false);
 }
 
 function duzenle(id) {
@@ -737,6 +807,8 @@ function duzenle(id) {
     $('#form-aciklama').val(row[prefix + '_aciklama'] || '');
     $('#form-ikon').val(row[prefix + '_ikon'] || '');
     $('#form-kapatma').prop('checked', row[prefix + '_kapatma_durumu'] == 1);
+    $('#form-otokapat-biz').prop('checked', row[prefix + '_otokapat_son_biz'] == 1);
+    $('#form-otokapat-musteri').prop('checked', row[prefix + '_otokapat_son_musteri'] == 1);
 
     $('#modal-baslik').text(TIPLER[aktifTip].tekil + ' Düzenle');
     modalAlanlarGoster(aktifTip);
@@ -760,7 +832,9 @@ function kaydet() {
         sira:   sira,
         aciklama:       $('#form-aciklama').val(),
         ikon:           $('#form-ikon').val().trim(),
-        kapatma_durumu: $('#form-kapatma').is(':checked') ? 1 : 0
+        kapatma_durumu:       $('#form-kapatma').is(':checked') ? 1 : 0,
+        otokapat_son_biz:     $('#form-otokapat-biz').is(':checked') ? 1 : 0,
+        otokapat_son_musteri: $('#form-otokapat-musteri').is(':checked') ? 1 : 0
     }, function (res) {
         if (res.success) {
             bootstrap.Modal.getInstance(document.getElementById('modalForm')).hide();

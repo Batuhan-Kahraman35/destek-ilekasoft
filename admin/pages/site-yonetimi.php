@@ -1,4 +1,4 @@
-<?php
+﻿<?php
 /**
  * Admin Panel - site Yönetimi
  * 
@@ -329,7 +329,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                                                 <div class="mb-3">
                                                     <label for="site_title" class="form-label">site Başliği <span class="text-danger">*</span></label>
                                                     <input type="text" class="form-control" id="site_title" name="site_title" 
-                                                           placeholder="Ornek Yazilim Portal" required>
+                                                           placeholder="OrnekYazilim Portal" required>
                                                 </div>
                                             </div>
                                             <div class="col-md-6">

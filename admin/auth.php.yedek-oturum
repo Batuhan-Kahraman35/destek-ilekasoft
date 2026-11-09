@@ -1,7 +1,7 @@
 <?php
 /**
  * Kimlik Doğrulama Fonksiyonları
- * Portal İleka Soft
+ * Portal Örnek Yazılım
  */
 
 session_start();

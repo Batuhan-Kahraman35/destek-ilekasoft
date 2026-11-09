@@ -274,12 +274,54 @@ class TicketService
             $ilkMesaj
         );
 
+        // AI Asistan: analiz kuyruğuna al (çalıştırıcı admin/cron/ai-calistirici.ps1 işler)
+        $this->aiAnaliziKuyrugaAl($ticketId, $konu, $islemKullaniciId);
+
         return [
             'ticket_id' => $ticketId,
             'ticket_no' => $ticketNo,
             'ek_sayisi' => $dosyaSonuc['ek_sayisi'],
             'ekler' => $dosyaSonuc['ekler'],
         ];
+    }
+
+    /**
+     * Yeni ticket'ı AI Asistan analiz kuyruğuna ekler (Ticket_AI_Ayarlari.otomatik_analiz = 1 ise).
+     * [Takip] ticket'ları dış taraf takibidir, analiz edilmez. Hata ticket açılışını etkilemez.
+     */
+    private function aiAnaliziKuyrugaAl(int $ticketId, string $konu, int $islemKullaniciId): void
+    {
+        try {
+            if (stripos($konu, '[Takip]') === 0) {
+                return;
+            }
+
+            $ayar = $this->db->fetchOne(
+                "SELECT Ticket_AI_Ayarlari_deger AS deger FROM dbo.Ticket_AI_Ayarlari
+                 WHERE Ticket_AI_Ayarlari_anahtar = 'otomatik_analiz' AND Durum = 1"
+            );
+            if (($ayar['deger'] ?? '0') !== '1') {
+                return;
+            }
+
+            $kuyrukta = $this->db->fetchOne(
+                "SELECT Tanim_AI_Durumlari_id AS id FROM dbo.Tanim_AI_Durumlari WHERE Tanim_AI_Durumlari_kod = 'kuyrukta'"
+            );
+            if (!$kuyrukta) {
+                return;
+            }
+
+            $now = app_now();
+            $this->db->insert('Ticket_AI_Oturumlari', [
+                'Ticket_AI_Oturumlari_ticket_id' => $ticketId,
+                'Ticket_AI_Oturumlari_durum_id' => (int)$kuyrukta['id'],
+                'OlusturanKullanici' => $islemKullaniciId,
+                'OlusturmaTarihi' => $now,
+                'Durum' => 1,
+            ]);
+        } catch (Throwable $e) {
+            error_log('AI analiz kuyrugu [ticket ' . $ticketId . ']: ' . $e->getMessage());
+        }
     }
 
     public function ticketMesajEkle(array $data): array

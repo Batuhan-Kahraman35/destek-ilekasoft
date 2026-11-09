@@ -22,10 +22,11 @@
  *      Genel/Normal; --atanan verilmezse ben. Ayni konulu ticket varsa acilmaz (--zorla ile acilir).
  *
  * Seçenekler:
- *   --kaynak=KOD      Yanıtı yazacak kaynak kodu (varsayılan: AI → ORNEKYAZILIM AI; kendi adınıza: --kaynak=BATUHAN)
+ *   --kaynak=KOD      Yanıtı yazacak kaynak kodu (varsayılan: AI → OrnekYazilim AI; kendi adınıza: --kaynak=BATUHAN)
  *   --mesaj-dosya=    Müşteriye gidecek yanıt metnini içeren dosya
  *   --icnot-dosya=    Yalnızca ekipte görünecek iç not metnini içeren dosya
- *   --ek-dosya=       Müşteri yanıtına eklenecek dosya(lar), virgülle ayrılır (resim/PDF/Office/txt, en fazla 10 MB)
+ *   --ek-dosya=       Eklenecek dosya(lar), virgülle ayrılır (resim/PDF/Office/txt, en fazla 10 MB).
+ *                     Müşteri yanıtı varsa ona, yoksa iç nota bağlanır.
  *   --durum=ID        Ticket durumunu günceller (opsiyonel)
  *   --oncelik=ID      Ticket önceliğini günceller (opsiyonel)
  *   --kategori=ID     Ticket kategorisini günceller (yalnizca guncelle komutunda)
@@ -757,10 +758,6 @@ function komutYanit(Database $db, int $ticketId, array $ajan, string $mesajText,
     if ($mesajText === '' && $icNotText === '') {
         throw new Exception('Mesaj veya ic not bos olamaz.');
     }
-    if (!empty($ekler) && $mesajText === '') {
-        throw new Exception('Ek dosya yalnizca musteri yanitina eklenebilir (--mesaj-dosya gerekli).');
-    }
-
     $ticket = $db->fetchOne(
         "SELECT Tickets_id FROM Tickets WHERE Tickets_id = ? AND Durum = 1",
         [$ticketId]
@@ -812,6 +809,7 @@ function komutYanit(Database $db, int $ticketId, array $ajan, string $mesajText,
             'musteri_yaniti' => $mesajText !== '' ? metinOzeti($mesajText) : null,
             'ic_not'         => $icNotText !== '' ? metinOzeti($icNotText) : null,
             'ekler'          => array_map(fn($ek) => $ek['ad'] . ' (' . $ek['mime'] . ', ' . $ek['boyut'] . ' bayt)', $ekler),
+            'ek_hedef'       => empty($ekler) ? null : ($mesajText !== '' ? 'musteri yaniti' : 'ic not'),
             'degisen'        => $hazirlik['degisen'],
             'tickets_update' => $ticketUpdate,
             'bildirim'       => $mesajText !== ''
@@ -853,6 +851,11 @@ function komutYanit(Database $db, int $ticketId, array $ajan, string $mesajText,
             'GuncellemeTarihi'             => $now,
             'Durum'                        => 1,
         ]);
+
+        // Müşteri yanıtı yoksa ekler iç nota bağlanır (müşteri iç not eklerini görmez)
+        if (!empty($ekler) && $mesajText === '') {
+            $sonuc['ek_idler'] = ekDosyalariKaydet($db, $ticketId, $sonuc['ic_not_id'], $ekler, $kullaniciId, $now);
+        }
     }
 
     $ticketUpdate = [
