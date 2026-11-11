@@ -5,6 +5,7 @@
 
 require_once __DIR__ . '/../auth.php';
 require_once __DIR__ . '/../includes/PageAuth.php';
+require_once __DIR__ . '/../includes/GorevHatirlatma.php';
 requireAuth();
 
 $user = Auth::user();
@@ -418,10 +419,16 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             $durumlar        = $db->fetchAll("SELECT Ticket_Durumlar_id AS id, Ticket_Durumlar_ad AS ad, Ticket_Durumlar_renk AS renk FROM Ticket_Durumlar WHERE Durum = 1 ORDER BY Ticket_Durumlar_sira");
             $oncelikler      = $db->fetchAll("SELECT Ticket_Oncelikler_id AS id, Ticket_Oncelikler_ad AS ad, Ticket_Oncelikler_renk AS renk FROM Ticket_Oncelikler WHERE Durum = 1 ORDER BY Ticket_Oncelikler_sira");
             $kategoriler     = $db->fetchAll("SELECT Ticket_Kategoriler_id AS id, Ticket_Kategoriler_ad AS ad, Ticket_Kategoriler_renk AS renk FROM Ticket_Kategoriler WHERE Durum = 1 ORDER BY Ticket_Kategoriler_sira");
-            $personeller     = $isAdmin ? $db->fetchAll("SELECT kullanici_id AS id, kullanici_ad + ' ' + kullanici_soyad AS ad FROM kullanicilar WHERE kullanici_durum = 1 ORDER BY kullanici_ad") : [];
+            $personeller     = $isAdmin ? $db->fetchAll("
+                SELECT kullanici_id AS id, kullanici_ad + ' ' + kullanici_soyad AS ad,
+                       CASE WHEN NULLIF(LTRIM(RTRIM(kullanici_telefon)), '') IS NULL THEN 0 ELSE 1 END AS telefon_var,
+                       CASE WHEN NULLIF(LTRIM(RTRIM(kullanici_email)), '')   IS NULL THEN 0 ELSE 1 END AS eposta_var
+                FROM kullanicilar WHERE kullanici_durum = 1 ORDER BY kullanici_ad") : [];
             $gorevDurumlari  = $db->fetchAll("SELECT Ticket_Durumlar_id AS id, Ticket_Durumlar_ad AS ad, Ticket_Durumlar_renk AS renk, Ticket_Durumlar_kapatma_durumu AS kapatma FROM Ticket_Durumlar WHERE Durum = 1 ORDER BY Ticket_Durumlar_sira");
+            $hatirlatmaSecenekleri = GorevHatirlatma::secenekler($db);
+            $hatirlatmaKanallari   = GorevHatirlatma::kanallar($db);
 
-            echo json_encode(['success' => true, 'data' => compact('durumlar', 'oncelikler', 'kategoriler', 'personeller', 'gorevDurumlari')]);
+            echo json_encode(['success' => true, 'data' => compact('durumlar', 'oncelikler', 'kategoriler', 'personeller', 'gorevDurumlari', 'hatirlatmaSecenekleri', 'hatirlatmaKanallari')]);
             exit;
         }
 
@@ -443,13 +450,20 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                     d.Ticket_Durumlar_kapatma_durumu AS durum_kapatma,
                     k.kullanici_ad            AS atanan_ad,
                     k.kullanici_soyad         AS atanan_soyad,
-                    g.Ticket_Gorevler_atanan_id
+                    g.Ticket_Gorevler_atanan_id,
+                    CONVERT(VARCHAR(16), g.Ticket_Gorevler_hatirlatma_tarihi, 120)          AS hatirlatma_tarihi,
+                    CONVERT(VARCHAR(16), g.Ticket_Gorevler_hatirlatma_gonderim_tarihi, 120) AS hatirlatma_gonderim_tarihi,
+                    g.Ticket_Gorevler_erteleme_sayisi AS erteleme_sayisi,
+                    CASE WHEN g.Ticket_Gorevler_hatirlatma_tarihi < ? THEN 1 ELSE 0 END AS hatirlatma_gecti,
+                    (SELECT COUNT(DISTINCT a.Ticket_Gorev_Alicilari_kullanici_id)
+                       FROM Ticket_Gorev_Alicilari a
+                      WHERE a.Ticket_Gorev_Alicilari_gorev_id = g.Ticket_Gorevler_id AND a.Durum = 1) AS alici_sayisi
                 FROM Ticket_Gorevler g
                 INNER JOIN Ticket_Durumlar d ON g.Ticket_Gorevler_durum_id = d.Ticket_Durumlar_id
                 LEFT  JOIN kullanicilar    k ON g.Ticket_Gorevler_atanan_id = k.kullanici_id
-                WHERE g.Ticket_Gorevler_ticket_id = ?
+                WHERE g.Ticket_Gorevler_ticket_id = ? AND g.Durum = 1
                 ORDER BY g.Ticket_Gorevler_sira, g.Ticket_Gorevler_id
-            ", [$ticketId]);
+            ", [app_now(), $ticketId]);
 
             echo json_encode(['success' => true, 'data' => $gorevler]);
             exit;
@@ -465,8 +479,15 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             $baslik    = trim($_POST['baslik']    ?? '');
             $aciklama  = trim($_POST['aciklama']  ?? '') ?: null;
             $atananId  = !empty($_POST['atanan_id']) ? intval($_POST['atanan_id']) : null;
+            $hatirlatma = trim($_POST['hatirlatma_tarihi'] ?? '');
 
             if (empty($baslik)) throw new Exception('Görev başlığı boş olamaz.');
+
+            // Hatırlatma, görev kaydından önce doğrulanır (hatalı tarihte görev oluşmasın)
+            $hatirlatmaTarihi = $hatirlatma !== '' ? GorevHatirlatma::tarihCoz($db, $hatirlatma) : null;
+            if ($hatirlatmaTarihi !== null && $hatirlatmaTarihi <= app_now()) {
+                throw new Exception('Hatırlatma tarihi geçmişte olamaz.');
+            }
 
             $now = app_now();
             $gorevId = $db->insert('Ticket_Gorevler', [
@@ -476,13 +497,70 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                 'Ticket_Gorevler_atanan_id' => $atananId,
                 'Ticket_Gorevler_durum_id'  => 1,
                 'Ticket_Gorevler_sira'      => 0,
+                'Ticket_Gorevler_hatirlatma_tarihi' => $hatirlatmaTarihi,
                 'OlusturanKullanici'        => $user['kullanici_id'],
                 'OlusturmaTarihi'           => $now,
                 'GuncelleyenKullanici'      => $user['kullanici_id'],
                 'GuncellemeTarihi'          => $now,
+                'Durum'                     => 1,
             ]);
 
             echo json_encode(['success' => true, 'message' => 'Görev eklendi.', 'gorev_id' => $gorevId]);
+            exit;
+        }
+
+        // -----------------------------------------------------------------
+        // gorev_hatirlatma_getir / gorev_hatirlatma_kaydet / gorev_ertele
+        // -----------------------------------------------------------------
+        if (in_array($action, ['gorev_hatirlatma_getir', 'gorev_hatirlatma_kaydet', 'gorev_ertele'], true)) {
+            $gorevId = intval($_POST['gorev_id'] ?? 0);
+            if ($gorevId <= 0) throw new Exception('Geçersiz görev.');
+
+            $gorev = $db->fetchOne("
+                SELECT Ticket_Gorevler_id, Ticket_Gorevler_atanan_id, OlusturanKullanici,
+                       CONVERT(VARCHAR(16), Ticket_Gorevler_hatirlatma_tarihi, 120) AS hatirlatma_tarihi
+                FROM Ticket_Gorevler
+                WHERE Ticket_Gorevler_id = ? AND Ticket_Gorevler_ticket_id = ? AND Durum = 1
+            ", [$gorevId, $ticketId]);
+            if (!$gorev) throw new Exception('Görev bulunamadı.');
+
+            if ($action === 'gorev_hatirlatma_getir') {
+                echo json_encode(['success' => true, 'data' => [
+                    'hatirlatma_tarihi' => $gorev['hatirlatma_tarihi'],
+                    'alicilar'          => GorevHatirlatma::alicilariGetir($db, $gorevId),
+                    'varsayilan_alici'  => (int)($gorev['Ticket_Gorevler_atanan_id'] ?: $gorev['OlusturanKullanici']),
+                ]]);
+                exit;
+            }
+
+            if (!$pagePermissions['can_edit']) throw new Exception('Düzenleme yetkiniz yok.');
+
+            if ($action === 'gorev_ertele') {
+                $secenek = GorevHatirlatma::secenekBul($db, (string)($_POST['secenek_id'] ?? ''));
+                if (!$secenek) throw new Exception('Erteleme seçeneği bulunamadı.');
+
+                $yeniTarih = GorevHatirlatma::tarihHesapla($secenek);
+                GorevHatirlatma::ertele($db, $gorevId, $yeniTarih, (int)$user['kullanici_id']);
+
+                echo json_encode(['success' => true, 'message' => 'Hatırlatma ertelendi: ' . date('d.m.Y H:i', strtotime($yeniTarih))]);
+                exit;
+            }
+
+            // gorev_hatirlatma_kaydet: tarih boşsa hatırlatma kaldırılır
+            $tarihGirdi = trim($_POST['hatirlatma_tarihi'] ?? '');
+            $tarih      = $tarihGirdi !== '' ? GorevHatirlatma::tarihCoz($db, $tarihGirdi) : null;
+
+            // alicilar: {"kullanici_id": [kanal_id, ...]}
+            // Yönetici olmayan kullanıcı alıcıları değiştiremez (null → mevcut alıcılar korunur)
+            $alicilar = null;
+            if ($isAdmin) {
+                $alicilar = json_decode($_POST['alicilar'] ?? '[]', true);
+                if (!is_array($alicilar)) throw new Exception('Geçersiz alıcı listesi.');
+            }
+
+            GorevHatirlatma::kaydet($db, $gorevId, $tarih, $alicilar, (int)$user['kullanici_id']);
+
+            echo json_encode(['success' => true, 'message' => $tarih ? 'Hatırlatma kaydedildi.' : 'Hatırlatma kaldırıldı.']);
             exit;
         }
 
@@ -935,6 +1013,12 @@ if ($isAdmin) {
                                     <select id="gorevAtanan" class="form-select form-select-sm mb-2 select2-gorev-atanan">
                                         <option value="">Atanan kişi seç...</option>
                                     </select>
+                                    <div class="input-group input-group-sm mb-2 mt-1" title="Hatırlatma (opsiyonel)">
+                                        <span class="input-group-text"><i class="bi bi-bell"></i></span>
+                                        <input type="datetime-local" class="form-control" id="gorevHatirlatma">
+                                        <button class="btn btn-outline-secondary dropdown-toggle" type="button" data-bs-toggle="dropdown" aria-expanded="false">Hızlı</button>
+                                        <ul class="dropdown-menu dropdown-menu-end hatirlatma-hizli-menu" data-hedef="#gorevHatirlatma"></ul>
+                                    </div>
                                     <button class="btn btn-primary btn-sm w-100" id="btnGorevEkle">
                                         <i class="bi bi-plus-circle me-1"></i> Görev Ekle
                                     </button>
@@ -951,6 +1035,44 @@ if ($isAdmin) {
     </main>
 
     <?php include __DIR__ . '/../includes/footer.php'; ?>
+</div>
+
+<!-- Görev Hatırlatma Modal -->
+<div class="modal fade" id="modalHatirlatma" tabindex="-1" aria-hidden="true">
+    <div class="modal-dialog">
+        <div class="modal-content">
+            <div class="modal-header">
+                <h6 class="modal-title"><i class="bi bi-bell me-1"></i> Görev Hatırlatması</h6>
+                <button type="button" class="btn-close" data-bs-dismiss="modal" aria-label="Kapat"></button>
+            </div>
+            <div class="modal-body">
+                <input type="hidden" id="hatirlatmaGorevId">
+                <div class="small fw-semibold mb-2" id="hatirlatmaGorevBaslik"></div>
+
+                <label class="form-label small mb-1" for="hatirlatmaTarih">Hatırlatma zamanı</label>
+                <div class="input-group input-group-sm mb-3">
+                    <input type="datetime-local" class="form-control" id="hatirlatmaTarih">
+                    <button class="btn btn-outline-secondary dropdown-toggle" type="button" data-bs-toggle="dropdown" aria-expanded="false">Hızlı</button>
+                    <ul class="dropdown-menu dropdown-menu-end hatirlatma-hizli-menu" data-hedef="#hatirlatmaTarih"></ul>
+                </div>
+
+                <div id="hatirlatmaAliciWrap" style="display:none">
+                    <label class="form-label small mb-1" for="hatirlatmaAlicilar">Alıcılar</label>
+                    <select id="hatirlatmaAlicilar" class="form-select form-select-sm" multiple></select>
+                    <div class="form-text mb-2">Panel ve push bildirimi her alıcıya gider. Seçilmezse görevin atananına (yoksa oluşturana) gider.</div>
+                    <div id="hatirlatmaKanalListesi"></div>
+                </div>
+                <div id="hatirlatmaAliciBilgi" class="small text-muted" style="display:none"></div>
+            </div>
+            <div class="modal-footer justify-content-between">
+                <button type="button" class="btn btn-outline-danger btn-sm" id="btnHatirlatmaKaldir"><i class="bi bi-bell-slash me-1"></i> Kaldır</button>
+                <div>
+                    <button type="button" class="btn btn-secondary btn-sm" data-bs-dismiss="modal">İptal</button>
+                    <button type="button" class="btn btn-primary btn-sm" id="btnHatirlatmaKaydet"><i class="bi bi-check2 me-1"></i> Kaydet</button>
+                </div>
+            </div>
+        </div>
+    </div>
 </div>
 
 <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/js/bootstrap.bundle.min.js" crossorigin="anonymous"></script>
@@ -1417,6 +1539,8 @@ function loadSelectOptions() {
                 $('#atama-select').val(t.Tickets_atanan_kullanici_id).trigger('change');
             }
         }
+
+        hatirlatmaMenuleriDoldur();
     });
 }
 
@@ -1661,6 +1785,7 @@ function loadGorevler() {
                             <div class="fw-semibold small ${tamamlandi ? 'text-decoration-line-through text-muted' : ''}">${escHtml(g.Ticket_Gorevler_baslik)}</div>
                             ${g.Ticket_Gorevler_aciklama ? `<div class="text-muted" style="font-size:0.75rem">${escHtml(g.Ticket_Gorevler_aciklama)}</div>` : ''}
                             ${atananAd ? `<div class="text-muted mt-1" style="font-size:0.72rem"><i class="bi bi-person me-1"></i>${escHtml(atananAd)}</div>` : ''}
+                            ${hatirlatmaRozeti(g, tamamlandi)}
                         </div>
                         <div class="d-flex flex-column align-items-end gap-1">
                             <span class="badge" style="background-color:${renk};font-size:0.7rem">${escHtml(g.durum_ad)}</span>
@@ -1669,11 +1794,115 @@ function loadGorevler() {
                     <div class="d-flex gap-1 mt-2">
                         <select class="form-select form-select-sm gorev-durum-select flex-grow-1" data-id="${g.Ticket_Gorevler_id}" style="font-size:0.75rem">${durumSecenek}</select>
                         <button class="btn btn-outline-primary btn-sm gorev-durum-kaydet" data-id="${g.Ticket_Gorevler_id}" title="Durumu Güncelle"><i class="bi bi-check2"></i></button>
+                        <button class="btn btn-outline-warning btn-sm gorev-hatirlatma-btn" data-id="${g.Ticket_Gorevler_id}" data-baslik="${escHtml(g.Ticket_Gorevler_baslik)}" title="Hatırlatma"><i class="bi bi-bell"></i></button>
+                        ${g.hatirlatma_tarihi && !tamamlandi ? `
+                        <div class="btn-group">
+                            <button class="btn btn-outline-secondary btn-sm dropdown-toggle" type="button" data-bs-toggle="dropdown" aria-expanded="false" title="Ertele"><i class="bi bi-alarm"></i></button>
+                            <ul class="dropdown-menu dropdown-menu-end gorev-ertele-menu" data-id="${g.Ticket_Gorevler_id}"></ul>
+                        </div>` : ''}
                         <button class="btn btn-outline-danger btn-sm gorev-sil-btn" data-id="${g.Ticket_Gorevler_id}" title="Görevi Sil"><i class="bi bi-trash"></i></button>
                     </div>
                 </div>
             `);
         });
+
+        hatirlatmaMenuleriDoldur();
+    });
+}
+
+// -------------------------------------------------------
+// Görev hatırlatmaları
+// -------------------------------------------------------
+function tarihTr(s) {
+    // "2026-11-14 09:00" → "14.11.2026 09:00"
+    if (!s) return '';
+    const [t, sa] = s.split(' ');
+    const [y, a, g] = t.split('-');
+    return `${g}.${a}.${y} ${sa || ''}`.trim();
+}
+
+function yerelInputDegeri(d) {
+    const p = n => String(n).padStart(2, '0');
+    return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())}T${p(d.getHours())}:${p(d.getMinutes())}`;
+}
+
+// Tanim_Hatirlatma_Secenekleri: dakika doluysa şimdi + dakika, değilse bugün + gün, saat
+function secenekTarihi(s) {
+    const d = new Date();
+    if (s.dakika !== null && s.dakika !== '') {
+        d.setMinutes(d.getMinutes() + parseInt(s.dakika, 10));
+    } else {
+        const [h, m] = (s.saat || '09:00').split(':');
+        d.setDate(d.getDate() + parseInt(s.gun || 0, 10));
+        d.setHours(parseInt(h, 10), parseInt(m, 10), 0, 0);
+    }
+    return d;
+}
+
+function hatirlatmaRozeti(g, tamamlandi) {
+    if (!g.hatirlatma_tarihi) return '';
+    const ertelenme = g.erteleme_sayisi > 0 ? ` · ${g.erteleme_sayisi}x ertelendi` : '';
+    const alici     = g.alici_sayisi > 0 ? ` · ${g.alici_sayisi} alıcı` : '';
+    let sinif = 'text-bg-light border', ikon = 'bi-bell';
+    if (g.hatirlatma_gonderim_tarihi) {
+        sinif = 'text-bg-secondary'; ikon = 'bi-bell-fill';
+    } else if (g.hatirlatma_gecti == 1 && !tamamlandi) {
+        sinif = 'text-bg-danger'; ikon = 'bi-bell-fill';
+    }
+    const baslik = g.hatirlatma_gonderim_tarihi ? `Gönderildi: ${tarihTr(g.hatirlatma_gonderim_tarihi)}` : 'Bekliyor';
+    return `<div class="mt-1"><span class="badge ${sinif}" style="font-size:0.7rem" title="${baslik}"><i class="bi ${ikon} me-1"></i>${tarihTr(g.hatirlatma_tarihi)}${ertelenme}${alici}</span></div>`;
+}
+
+function hatirlatmaMenuleriDoldur() {
+    const secenekler = selectOptions.hatirlatmaSecenekleri || [];
+    if (!secenekler.length) return;
+    const ogeler = cls => secenekler.map(s =>
+        `<li><a class="dropdown-item small ${cls}" href="#" data-secenek="${s.id}">${escHtml(s.ad)}</a></li>`
+    ).join('');
+
+    $('.hatirlatma-hizli-menu').each(function () {
+        $(this).html(ogeler('hatirlatma-hizli-oge') +
+            '<li><hr class="dropdown-divider"></li><li><a class="dropdown-item small text-danger hatirlatma-temizle" href="#">Temizle</a></li>');
+    });
+    $('.gorev-ertele-menu').each(function () {
+        $(this).html('<li><h6 class="dropdown-header">Ertele</h6></li>' + ogeler('gorev-ertele-oge'));
+    });
+}
+
+let hatirlatmaKanalSecim = {}; // {kullanici_id: [kanal_id, ...]} (PUSH hariç)
+
+function kanalKullanilabilir(kanal, personel) {
+    if (!personel) return true;
+    if (kanal.kod === 'WHATSAPP') return personel.telefon_var == 1;
+    if (kanal.kod === 'MAIL')     return personel.eposta_var == 1;
+    return true;
+}
+
+function hatirlatmaKanallariniCiz() {
+    const kanallar = selectOptions.hatirlatmaKanallari || [];
+    const secili   = $('#hatirlatmaAlicilar').val() || [];
+    const kutu     = $('#hatirlatmaKanalListesi').empty();
+
+    secili.forEach(function (uid) {
+        const p = (selectOptions.personeller || []).find(x => String(x.id) === String(uid));
+        const ad = p ? p.ad : ('#' + uid);
+        const seciliKanallar = (hatirlatmaKanalSecim[uid] || []).map(String);
+
+        const switchler = kanallar.map(function (k) {
+            const id      = `hk_${uid}_${k.id}`;
+            const push    = k.kod === 'PUSH';
+            const uygun   = kanalKullanilabilir(k, p);
+            const checked = push || seciliKanallar.includes(String(k.id));
+            const neden   = !uygun ? (k.kod === 'WHATSAPP' ? ' (telefon yok)' : ' (e-posta yok)') : '';
+            return `
+                <div class="form-check form-switch form-check-inline mb-0">
+                    <input class="form-check-input hatirlatma-kanal" type="checkbox" role="switch" id="${id}"
+                           data-uid="${uid}" value="${k.id}" ${checked && uygun ? 'checked' : ''} ${push || !uygun ? 'disabled' : ''}>
+                    <label class="form-check-label small" for="${id}">${escHtml(k.ad)}${neden}</label>
+                </div>`;
+        }).join('');
+
+        kutu.append(`<div class="border rounded px-2 py-1 mb-1"><div class="small fw-semibold">${escHtml(ad)}</div>${switchler}</div>`);
     });
 }
 
@@ -1722,11 +1951,13 @@ $(document).ready(function() {
         }
 
         $(this).prop('disabled', true);
-        postAjax({ action: 'gorev_ekle', ticket_id: TICKET_ID, baslik: baslik, aciklama: aciklama, atanan_id: atananId || '' }, function(res) {
+        const hatirlatma = $('#gorevHatirlatma').val();
+        postAjax({ action: 'gorev_ekle', ticket_id: TICKET_ID, baslik: baslik, aciklama: aciklama, atanan_id: atananId || '', hatirlatma_tarihi: hatirlatma || '' }, function(res) {
             $('#btnGorevEkle').prop('disabled', false);
             if (res.success) {
                 $('#gorevBaslik').val('');
                 $('#gorevAciklama').val('');
+                $('#gorevHatirlatma').val('');
                 $('#gorevAtanan').val('').trigger('change');
                 Swal.fire({ toast: true, position: 'top-end', icon: 'success', title: 'Görev eklendi', showConfirmButton: false, timer: 1500 });
                 loadGorevler();
@@ -1734,6 +1965,126 @@ $(document).ready(function() {
                 Swal.fire('Hata', res.message, 'error');
             }
         });
+    });
+
+    // Hatırlatma: hızlı seçim (ekleme formu ve modal)
+    $(document).on('click', '.hatirlatma-hizli-oge', function (e) {
+        e.preventDefault();
+        const s = (selectOptions.hatirlatmaSecenekleri || []).find(x => String(x.id) === String($(this).data('secenek')));
+        if (!s) return;
+        $($(this).closest('.hatirlatma-hizli-menu').data('hedef')).val(yerelInputDegeri(secenekTarihi(s)));
+    });
+    $(document).on('click', '.hatirlatma-temizle', function (e) {
+        e.preventDefault();
+        $($(this).closest('.hatirlatma-hizli-menu').data('hedef')).val('');
+    });
+
+    // Hatırlatma: ertele
+    $(document).on('click', '.gorev-ertele-oge', function (e) {
+        e.preventDefault();
+        const gorevId = $(this).closest('.gorev-ertele-menu').data('id');
+        postAjax({ action: 'gorev_ertele', ticket_id: TICKET_ID, gorev_id: gorevId, secenek_id: $(this).data('secenek') }, function (res) {
+            if (res.success) {
+                Swal.fire({ toast: true, position: 'top-end', icon: 'success', title: res.message, showConfirmButton: false, timer: 1800 });
+                loadGorevler();
+            } else {
+                Swal.fire('Hata', res.message, 'error');
+            }
+        });
+    });
+
+    // Hatırlatma: modal
+    const modalHatirlatma = new bootstrap.Modal(document.getElementById('modalHatirlatma'));
+    let aliciSelectHazir = false;
+
+    function aliciSelectHazirla() {
+        if (aliciSelectHazir || !IS_ADMIN || !(selectOptions.personeller || []).length) return;
+        const sel = $('#hatirlatmaAlicilar');
+        selectOptions.personeller.forEach(p => sel.append(`<option value="${p.id}">${escHtml(p.ad)}</option>`));
+        sel.select2({ theme: 'bootstrap-5', width: '100%', placeholder: 'Personel ara...', dropdownParent: $('#modalHatirlatma') });
+        sel.on('change', function () {
+            // Kanal seçimlerini koruyarak yeniden çiz
+            $('.hatirlatma-kanal').each(function () { kanalSecimiOku(this); });
+            hatirlatmaKanallariniCiz();
+        });
+        aliciSelectHazir = true;
+    }
+
+    function kanalSecimiOku(el) {
+        const uid = String($(el).data('uid'));
+        const kid = String($(el).val());
+        const liste = (hatirlatmaKanalSecim[uid] || []).map(String).filter(x => x !== kid);
+        if ($(el).is(':checked')) liste.push(kid);
+        hatirlatmaKanalSecim[uid] = liste;
+    }
+    $(document).on('change', '.hatirlatma-kanal', function () { kanalSecimiOku(this); });
+
+    $(document).on('click', '.gorev-hatirlatma-btn', function () {
+        const gorevId = $(this).data('id');
+        $('#hatirlatmaGorevId').val(gorevId);
+        $('#hatirlatmaGorevBaslik').text($(this).data('baslik'));
+
+        postAjax({ action: 'gorev_hatirlatma_getir', ticket_id: TICKET_ID, gorev_id: gorevId }, function (res) {
+            if (!res.success) { Swal.fire('Hata', res.message, 'error'); return; }
+            const d = res.data;
+            $('#hatirlatmaTarih').val(d.hatirlatma_tarihi ? d.hatirlatma_tarihi.replace(' ', 'T') : '');
+            $('#btnHatirlatmaKaldir').toggle(!!d.hatirlatma_tarihi);
+
+            hatirlatmaKanalSecim = {};
+            d.alicilar.forEach(a => { hatirlatmaKanalSecim[String(a.kullanici_id)] = a.kanallar.map(k => String(k.id)); });
+
+            aliciSelectHazirla();
+            if (aliciSelectHazir) {
+                $('#hatirlatmaAliciWrap').show();
+                $('#hatirlatmaAliciBilgi').hide();
+                $('#hatirlatmaAlicilar').val(d.alicilar.map(a => String(a.kullanici_id))).trigger('change.select2');
+                hatirlatmaKanallariniCiz();
+            } else {
+                $('#hatirlatmaAliciWrap').hide();
+                const metin = d.alicilar.length
+                    ? 'Alıcılar: ' + d.alicilar.map(a => `${a.ad} (${a.kanallar.map(k => k.ad).join(', ')})`).join('; ')
+                    : 'Alıcı: görevin atananı (yoksa oluşturanı), panel + push.';
+                $('#hatirlatmaAliciBilgi').text(metin).show();
+            }
+            modalHatirlatma.show();
+        });
+    });
+
+    function hatirlatmaGonder(tarih) {
+        const gorevId = $('#hatirlatmaGorevId').val();
+        const alicilar = {};
+        if (aliciSelectHazir) {
+            ($('#hatirlatmaAlicilar').val() || []).forEach(uid => {
+                alicilar[uid] = $(`.hatirlatma-kanal[data-uid="${uid}"]:checked:not(:disabled)`).map(function () { return $(this).val(); }).get();
+            });
+        }
+        postAjax({ action: 'gorev_hatirlatma_kaydet', ticket_id: TICKET_ID, gorev_id: gorevId, hatirlatma_tarihi: tarih, alicilar: JSON.stringify(alicilar) }, function (res) {
+            if (res.success) {
+                modalHatirlatma.hide();
+                Swal.fire({ toast: true, position: 'top-end', icon: 'success', title: res.message, showConfirmButton: false, timer: 1500 });
+                loadGorevler();
+            } else {
+                Swal.fire('Hata', res.message, 'error');
+            }
+        });
+    }
+
+    $('#btnHatirlatmaKaydet').on('click', function () {
+        const tarih = $('#hatirlatmaTarih').val();
+        if (!tarih) { Swal.fire('Uyarı', 'Hatırlatma zamanı seçin.', 'warning'); return; }
+        hatirlatmaGonder(tarih);
+    });
+
+    $('#btnHatirlatmaKaldir').on('click', function () {
+        Swal.fire({
+            title: 'Hatırlatma kaldırılsın mı?',
+            text: 'Alıcı ve kanal seçimleri de silinir.',
+            icon: 'warning',
+            showCancelButton: true,
+            confirmButtonText: 'Evet, Kaldır',
+            cancelButtonText: 'İptal',
+            confirmButtonColor: '#dc3545'
+        }).then(r => { if (r.isConfirmed) hatirlatmaGonder(''); });
     });
 
     // Görev Durum Güncelle

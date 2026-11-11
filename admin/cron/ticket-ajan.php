@@ -15,6 +15,12 @@
  *   php admin/cron/ticket-ajan.php yanit 246 --mesaj-dosya=temp/yanit.txt --durum=Cozuldu --atanan=ben --onizleme
  *   php admin/cron/ticket-ajan.php ara "Hepsiburada key" --proje=PORTAL --durum=acik
  *   php admin/cron/ticket-ajan.php ac --konu="[Takip] ..." --mesaj-dosya=temp/takip.txt --proje=PORTAL --durum=Beklemede --onizleme
+ *   php admin/cron/ticket-ajan.php gorev-ekle 246 --baslik="Banka donusunu kontrol et" --aciklama-dosya=temp/gorev.txt --hatirlatma="Yarın 09:00" --atanan=ben --alici=ben --kanal=WHATSAPP --onizleme
+ *   php admin/cron/ticket-ajan.php gorev-ertele 246 --gorev=15 --hatirlatma="1 saat sonra" --onizleme
+ *
+ * gorev-ekle:   ticket'a gorev ekler; --hatirlatma verilirse hatirlatma kurar. --alici verilmezse alici atanan,
+ *               atanan yoksa ben. PUSH (panel + push) her aliciya eklenir; --kanal ile WHATSAPP / MAIL eklenir.
+ * gorev-ertele: hatirlatmayi yeni tarihe tasir (sayac artar, gonderim sifirlanir); hatirlatma yoksa kurar.
  *
  * ara: konu ve mesajlarda (ic notlar dahil) arar; her kelime konu veya bir mesajda gecmelidir.
  *      Acik ve kapali tum ticket'lar doner. --proje kaynak kodu veya host olabilir.
@@ -46,6 +52,7 @@ if (php_sapi_name() !== 'cli') {
 
 require_once __DIR__ . '/../db.php';
 require_once __DIR__ . '/../includes/TicketService.php';
+require_once __DIR__ . '/../includes/GorevHatirlatma.php';
 
 const AJAN_VARSAYILAN_KAYNAK = 'AI';
 const AJAN_SAHIP_KAYNAK      = 'BATUHAN';
@@ -631,12 +638,43 @@ function komutDetay(Database $db, int $ticketId, string $vhostRoot): array
             "SELECT kullanici_id AS id, kullanici_ad + ' ' + kullanici_soyad AS ad
              FROM kullanicilar WHERE kullanici_durum = 1 ORDER BY kullanici_ad"
         ) ?: [],
+        'hatirlatma_secenekleri' => array_map(
+            static fn($s) => ['id' => $s['id'], 'ad' => $s['ad'], 'tarih' => GorevHatirlatma::tarihHesapla($s)],
+            GorevHatirlatma::secenekler($db)
+        ),
+        'hatirlatma_kanallari' => array_map(
+            static fn($k) => ['id' => $k['id'], 'kod' => $k['kod'], 'ad' => $k['ad']],
+            GorevHatirlatma::kanallar($db)
+        ),
     ];
+
+    $gorevler = $db->fetchAll(
+        "SELECT g.Ticket_Gorevler_id AS gorev_id,
+                g.Ticket_Gorevler_baslik AS baslik,
+                g.Ticket_Gorevler_aciklama AS aciklama,
+                d.Ticket_Durumlar_ad AS durum,
+                LTRIM(RTRIM(ISNULL(k.kullanici_ad, '') + ' ' + ISNULL(k.kullanici_soyad, ''))) AS atanan,
+                CONVERT(VARCHAR(16), g.Ticket_Gorevler_hatirlatma_tarihi, 120)          AS hatirlatma_tarihi,
+                CONVERT(VARCHAR(16), g.Ticket_Gorevler_hatirlatma_gonderim_tarihi, 120) AS hatirlatma_gonderim_tarihi,
+                g.Ticket_Gorevler_erteleme_sayisi AS erteleme_sayisi,
+                CONVERT(VARCHAR(16), g.OlusturmaTarihi, 120) AS olusturma_tarihi
+         FROM Ticket_Gorevler g
+         LEFT JOIN Ticket_Durumlar d ON d.Ticket_Durumlar_id = g.Ticket_Gorevler_durum_id
+         LEFT JOIN kullanicilar    k ON k.kullanici_id = g.Ticket_Gorevler_atanan_id
+         WHERE g.Ticket_Gorevler_ticket_id = ? AND g.Durum = 1
+         ORDER BY g.Ticket_Gorevler_sira, g.Ticket_Gorevler_id",
+        [$ticketId]
+    ) ?: [];
+    foreach ($gorevler as &$g) {
+        $g['alicilar'] = $g['hatirlatma_tarihi'] ? GorevHatirlatma::alicilariGetir($db, (int)$g['gorev_id']) : [];
+    }
+    unset($g);
 
     return [
         'ticket' => $ticket,
         'proje' => projeDiziniBul($ticket['kaynak_api_url'] ?? null, $vhostRoot),
         'secenekler' => $secenekler,
+        'gorevler' => $gorevler,
         'mesajlar' => $mesajlar,
         'ekler' => $ekler,
         'ozet' => [
@@ -1138,6 +1176,239 @@ function komutAc(Database $db, array $ajan, string $konu, string $mesajText, str
 }
 
 // ─────────────────────────────────────────────────────────────
+// Görev + hatırlatma komutları
+// ─────────────────────────────────────────────────────────────
+
+/**
+ * --alici ve --kanal seceneklerinden [kullanici_id => [kanal_id]] uretir.
+ * Kanal verilmezse yalniz PUSH; telefonu/e-postasi olmayan kisiye WHATSAPP/MAIL secilirse hata.
+ *
+ * @param int $varsayilanAlici --alici verilmezse kullanilacak kisi
+ */
+function gorevAlicilariHazirla(Database $db, array $secenek, array $ajan, int $varsayilanAlici): array
+{
+    $aliciIdler = [];
+    $aliciGirdi = trim((string)($secenek['alici'] ?? ''));
+    if ($aliciGirdi !== '') {
+        foreach (array_filter(array_map('trim', explode(',', $aliciGirdi))) as $parca) {
+            $kid = atananCoz($db, $parca, $ajan);
+            if (!$kid) throw new Exception("Gecersiz alici: {$parca}");
+            $aliciIdler[] = $kid;
+        }
+    } else {
+        $aliciIdler[] = $varsayilanAlici;
+    }
+
+    $pushId  = GorevHatirlatma::pushKanalId($db);
+    $kanallar = [];
+    foreach (array_filter(array_map('trim', explode(',', (string)($secenek['kanal'] ?? '')))) as $parca) {
+        $k = GorevHatirlatma::kanalBul($db, $parca);
+        if (!$k) {
+            $liste = implode(', ', array_map(static fn($x) => $x['id'] . '=' . $x['kod'], GorevHatirlatma::kanallar($db)));
+            throw new Exception("Kanal bulunamadi: '{$parca}'. Secenekler: {$liste}");
+        }
+        $kanallar[(int)$k['id']] = $k;
+    }
+
+    $sonuc = [];
+    foreach (array_unique($aliciIdler) as $kid) {
+        $kisi = $db->fetchOne(
+            "SELECT kullanici_ad, kullanici_soyad, kullanici_telefon, kullanici_email
+             FROM kullanicilar WHERE kullanici_id = ? AND kullanici_durum = 1",
+            [$kid]
+        );
+        if (!$kisi) throw new Exception("Alici bulunamadi veya pasif: kullanici_id={$kid}");
+        $ad = trim($kisi['kullanici_ad'] . ' ' . ($kisi['kullanici_soyad'] ?? ''));
+
+        $liste = [$pushId];
+        foreach ($kanallar as $kanalId => $k) {
+            $kod = strtoupper($k['kod']);
+            if ($kod === 'WHATSAPP' && trim((string)$kisi['kullanici_telefon']) === '') {
+                throw new Exception("{$ad} icin WhatsApp secilemez: telefon kaydi yok.");
+            }
+            if ($kod === 'MAIL' && trim((string)$kisi['kullanici_email']) === '') {
+                throw new Exception("{$ad} icin e-posta secilemez: e-posta kaydi yok.");
+            }
+            $liste[] = $kanalId;
+        }
+        $sonuc[$kid] = ['ad' => $ad, 'kanallar' => array_values(array_unique($liste))];
+    }
+    return $sonuc;
+}
+
+/** Plan raporu icin kanal ID'lerini kodlara cevirir */
+function gorevAliciOzeti(Database $db, array $alicilar): array
+{
+    $kodlar = array_column(GorevHatirlatma::kanallar($db), 'kod', 'id');
+    $ozet = [];
+    foreach ($alicilar as $kid => $a) {
+        $ozet[] = [
+            'kullanici_id' => $kid,
+            'ad'           => $a['ad'],
+            'kanallar'     => array_map(static fn($id) => $kodlar[$id] ?? (string)$id, $a['kanallar']),
+        ];
+    }
+    return $ozet;
+}
+
+/**
+ * gorev-ekle: ticket'a gorev ekler, istenirse hatirlatma kurar.
+ * Hatirlatma verilip --alici verilmezse alici: atanan, o da yoksa ajanin sahibi (ben).
+ */
+function komutGorevEkle(Database $db, int $ticketId, array $ajan, array $secenek, string $projeKoku): array
+{
+    $ticket = $db->fetchOne("SELECT Tickets_id, Tickets_no FROM Tickets WHERE Tickets_id = ? AND Durum = 1", [$ticketId]);
+    if (!$ticket) throw new Exception("Ticket bulunamadi: {$ticketId}");
+
+    $baslik = trim((string)($secenek['baslik'] ?? ''));
+    if ($baslik === '') throw new Exception('--baslik zorunlu.');
+
+    $aciklama = trim((string)($secenek['aciklama'] ?? ''));
+    if ($aciklama === '' && !empty($secenek['aciklama-dosya'])) {
+        $aciklama = metinOku($secenek['aciklama-dosya'], $projeKoku);
+    }
+    $aciklama = $aciklama !== '' ? $aciklama : null;
+
+    $atananId = atananCoz($db, $secenek['atanan'] ?? null, $ajan) ?: null;
+
+    $tarih = null;
+    if (trim((string)($secenek['hatirlatma'] ?? '')) !== '') {
+        $tarih = GorevHatirlatma::tarihCoz($db, (string)$secenek['hatirlatma']);
+        if ($tarih <= app_now()) throw new Exception('Hatirlatma tarihi gecmiste olamaz.');
+    } elseif (!empty($secenek['alici']) || !empty($secenek['kanal'])) {
+        throw new Exception('--alici / --kanal icin --hatirlatma gerekli.');
+    }
+
+    $alicilar = $tarih !== null
+        ? gorevAlicilariHazirla($db, $secenek, $ajan, $atananId ?: (int)$ajan['sahip']['kullanici_id'])
+        : [];
+
+    $kullaniciId = (int)$ajan['kullanici']['kullanici_id'];
+    $atananAd = null;
+    if ($atananId) {
+        $r = $db->fetchOne("SELECT kullanici_ad, kullanici_soyad FROM kullanicilar WHERE kullanici_id = ?", [$atananId]);
+        $atananAd = trim(($r['kullanici_ad'] ?? '') . ' ' . ($r['kullanici_soyad'] ?? ''));
+    }
+
+    $plan = [
+        'ticket_no'  => $ticket['Tickets_no'],
+        'baslik'     => $baslik,
+        'aciklama'   => $aciklama,
+        'atanan'     => $atananAd,
+        'hatirlatma' => $tarih,
+        'alicilar'   => gorevAliciOzeti($db, $alicilar),
+        'olusturan'  => trim($ajan['kullanici']['kullanici_ad'] . ' ' . ($ajan['kullanici']['kullanici_soyad'] ?? '')),
+    ];
+
+    if (onizlemeMi($secenek)) {
+        return [
+            'onizleme' => true,
+            'uyari'    => 'ONIZLEME: hicbir kayit yazilmadi. Kaydetmek icin --onizleme bayragini kaldirin.',
+            'plan'     => $plan,
+        ];
+    }
+
+    $now = app_now();
+    $gorevId = (int)$db->insert('Ticket_Gorevler', [
+        'Ticket_Gorevler_ticket_id'         => $ticketId,
+        'Ticket_Gorevler_baslik'            => $baslik,
+        'Ticket_Gorevler_aciklama'          => $aciklama,
+        'Ticket_Gorevler_atanan_id'         => $atananId,
+        'Ticket_Gorevler_durum_id'          => 1,
+        'Ticket_Gorevler_sira'              => 0,
+        'Ticket_Gorevler_hatirlatma_tarihi' => $tarih,
+        'OlusturanKullanici'                => $kullaniciId,
+        'OlusturmaTarihi'                   => $now,
+        'GuncelleyenKullanici'              => $kullaniciId,
+        'GuncellemeTarihi'                  => $now,
+        'Durum'                             => 1,
+    ]);
+
+    if ($alicilar) {
+        try {
+            GorevHatirlatma::kaydet($db, $gorevId, $tarih, array_map(static fn($a) => $a['kanallar'], $alicilar), $kullaniciId);
+        } catch (Throwable $e) {
+            // Alicilar yazilamadiysa yarim gorev birakma
+            $db->execute("DELETE FROM Ticket_Gorevler WHERE Ticket_Gorevler_id = ?", [$gorevId]);
+            throw $e;
+        }
+    }
+
+    return [
+        'onizleme' => false,
+        'gorev_id' => $gorevId,
+        'plan'     => $plan,
+        'link'     => 'https://destek.ornekproje.com/admin/ticket-detay?id=' . $ticketId,
+    ];
+}
+
+/**
+ * gorev-ertele: hatirlatmayi yeni tarihe tasir. Gorevde hatirlatma yoksa kurar (sayac artmaz).
+ * --alici / --kanal verilirse alicilar da yeniden yazilir.
+ */
+function komutGorevErtele(Database $db, int $ticketId, array $ajan, array $secenek): array
+{
+    $gorevId = (int)($secenek['gorev'] ?? 0);
+    if ($gorevId <= 0) throw new Exception('--gorev=ID zorunlu.');
+
+    $gorev = $db->fetchOne(
+        "SELECT Ticket_Gorevler_id, Ticket_Gorevler_baslik, Ticket_Gorevler_atanan_id, Ticket_Gorevler_erteleme_sayisi,
+                CONVERT(VARCHAR(16), Ticket_Gorevler_hatirlatma_tarihi, 120) AS hatirlatma_tarihi
+         FROM Ticket_Gorevler
+         WHERE Ticket_Gorevler_id = ? AND Ticket_Gorevler_ticket_id = ? AND Durum = 1",
+        [$gorevId, $ticketId]
+    );
+    if (!$gorev) throw new Exception("Gorev bulunamadi: {$gorevId} (ticket {$ticketId})");
+
+    if (trim((string)($secenek['hatirlatma'] ?? '')) === '') throw new Exception('--hatirlatma zorunlu.');
+    $tarih = GorevHatirlatma::tarihCoz($db, (string)$secenek['hatirlatma']);
+    if ($tarih <= app_now()) throw new Exception('Hatirlatma tarihi gecmiste olamaz.');
+
+    $alicilar = null;
+    if (!empty($secenek['alici']) || !empty($secenek['kanal'])) {
+        $varsayilan = (int)($gorev['Ticket_Gorevler_atanan_id'] ?: $ajan['sahip']['kullanici_id']);
+        $alicilar = gorevAlicilariHazirla($db, $secenek, $ajan, $varsayilan);
+    }
+
+    $islem = $gorev['hatirlatma_tarihi'] ? 'ertele' : 'kur';
+    if ($alicilar !== null) $islem = 'kaydet (alicilar yeniden yazilir)';
+
+    $plan = [
+        'gorev_id'       => $gorevId,
+        'baslik'         => $gorev['Ticket_Gorevler_baslik'],
+        'eski_tarih'     => $gorev['hatirlatma_tarihi'],
+        'yeni_tarih'     => $tarih,
+        'islem'          => $islem,
+        'erteleme_sayisi'=> (int)$gorev['Ticket_Gorevler_erteleme_sayisi'] + ($gorev['hatirlatma_tarihi'] ? 1 : 0),
+        'alicilar'       => $alicilar !== null ? gorevAliciOzeti($db, $alicilar) : GorevHatirlatma::alicilariGetir($db, $gorevId),
+    ];
+
+    if (onizlemeMi($secenek)) {
+        return [
+            'onizleme' => true,
+            'uyari'    => 'ONIZLEME: hicbir kayit yazilmadi. Kaydetmek icin --onizleme bayragini kaldirin.',
+            'plan'     => $plan,
+        ];
+    }
+
+    $kullaniciId = (int)$ajan['kullanici']['kullanici_id'];
+    if ($gorev['hatirlatma_tarihi']) {
+        GorevHatirlatma::ertele($db, $gorevId, $tarih, $kullaniciId);
+        if ($alicilar !== null) {
+            GorevHatirlatma::kaydet($db, $gorevId, $tarih, array_map(static fn($a) => $a['kanallar'], $alicilar), $kullaniciId);
+        }
+    } else {
+        GorevHatirlatma::kaydet(
+            $db, $gorevId, $tarih,
+            $alicilar !== null ? array_map(static fn($a) => $a['kanallar'], $alicilar) : null,
+            $kullaniciId
+        );
+    }
+
+    return ['onizleme' => false, 'plan' => $plan];
+}
+
+// ─────────────────────────────────────────────────────────────
 // Giriş noktası
 // ─────────────────────────────────────────────────────────────
 try {
@@ -1152,6 +1423,10 @@ try {
         echo "  php admin/cron/ticket-ajan.php guncelle <id|url> [--durum=] [--oncelik=] [--kategori=] [--atanan=]\n";
         echo "  php admin/cron/ticket-ajan.php ara \"<ifade>\" [--proje=KOD|host] [--durum=acik|kapali|hepsi] [--limit=20]\n";
         echo "  php admin/cron/ticket-ajan.php ac --konu=\"...\" --mesaj-dosya=... [--icnot-dosya=...] [--proje=KOD|host] [--kategori=] [--oncelik=] [--durum=] [--atanan=] [--zorla]\n";
+        echo "  php admin/cron/ticket-ajan.php gorev-ekle <id|url> --baslik=\"...\" [--aciklama=|--aciklama-dosya=] [--atanan=] [--hatirlatma=] [--alici=ben,12] [--kanal=WHATSAPP,MAIL]\n";
+        echo "  php admin/cron/ticket-ajan.php gorev-ertele <id|url> --gorev=ID --hatirlatma=\"1 saat sonra\" [--alici=] [--kanal=]\n";
+        echo "\n  --hatirlatma: \"2026-11-14 09:00\", \"14.11.2026 09:00\" veya hizli secim adi/ID'si (detay > secenekler.hatirlatma_secenekleri)\n";
+        echo "  --kanal: PUSH her aliciya otomatik eklenir; WHATSAPP/MAIL icin kisinin telefon/e-postasi olmali\n";
         echo "\n  --durum/--oncelik/--kategori: ID veya tanim adi (ornek: --durum=Cozuldu)\n";
         echo "  --atanan: kullanici_id, ad soyad, ben (BATUHAN kaynagi), ajan (yaniti yazan hesap) veya bos\n";
         echo "  --kaynak: yaniti yazacak kaynak kodu (varsayilan: AI)\n";
@@ -1211,6 +1486,17 @@ try {
         $ajan = ajanGetir($db, $kaynakKod, AJAN_SAHIP_KAYNAK);
 
         $sonuc = komutGuncelle($db, $ticketId, $ajan, $args['secenek']);
+        echo json_encode(['success' => true, 'data' => $sonuc], JSON_UNESCAPED_UNICODE | JSON_PRETTY_PRINT), PHP_EOL;
+        exit(0);
+    }
+
+    if ($komut === 'gorev-ekle' || $komut === 'gorev-ertele') {
+        $kaynakKod = strtoupper($args['secenek']['kaynak'] ?? AJAN_VARSAYILAN_KAYNAK);
+        $ajan = ajanGetir($db, $kaynakKod, AJAN_SAHIP_KAYNAK);
+
+        $sonuc = $komut === 'gorev-ekle'
+            ? komutGorevEkle($db, $ticketId, $ajan, $args['secenek'], $projeKoku)
+            : komutGorevErtele($db, $ticketId, $ajan, $args['secenek']);
         echo json_encode(['success' => true, 'data' => $sonuc], JSON_UNESCAPED_UNICODE | JSON_PRETTY_PRINT), PHP_EOL;
         exit(0);
     }
