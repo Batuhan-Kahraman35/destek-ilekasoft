@@ -138,8 +138,14 @@ switch ($Komut) {
         Write-Output ($h -join "`n")
 
         Write-Output '--- gitleaks'
-        $g = & gitleaks dir $pub --config $GitleaksCfg --no-banner --redact 2>&1 | ForEach-Object { "$_" }
-        $leaksKod = $LASTEXITCODE
+        # .gitleaksignore parmak izleri ".public/..." goreli yoldur: tarama proje kokunden goreli yolla yapilir.
+        $leaksArg = @('dir', '.public', '--config', $GitleaksCfg, '--no-banner', '--redact')
+        if (Test-Path -LiteralPath (Join-Path $kok '.gitleaksignore')) { $leaksArg += @('--gitleaks-ignore-path', '.gitleaksignore') }
+        Push-Location -LiteralPath $kok
+        try {
+            $g = & gitleaks @leaksArg 2>&1 | ForEach-Object { "$_" }
+            $leaksKod = $LASTEXITCODE
+        } finally { Pop-Location }
         Write-Output ($g -join "`n")
 
         Write-Output '--- Public degisen dosyalar'

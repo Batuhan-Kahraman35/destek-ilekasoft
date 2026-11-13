@@ -441,6 +441,26 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                 exit;
 
             // -----------------------------------------------------------------
+            // Kaynak değiştirme (sayfa yalnız admin) - 0: Panel (kaynaksız)
+            // -----------------------------------------------------------------
+            case 'kaynak_guncelle':
+                if (!$isAdmin) throw new Exception('Bu işlem için yetkiniz yok.');
+                if ($ticketId <= 0) throw new Exception('Geçersiz ticket.');
+                $deger = (int)($_POST['deger_id'] ?? 0);
+                if ($deger > 0 && !$db->fetchOne("SELECT Ticket_Kaynak_id FROM dbo.Ticket_Kaynak WHERE Ticket_Kaynak_id = ? AND Durum = 1", [$deger])) {
+                    throw new Exception('Kaynak bulunamadı.');
+                }
+
+                $db->update('dbo.Tickets', [
+                    'Tickets_kaynak_id'    => $deger > 0 ? $deger : null,
+                    'GuncelleyenKullanici' => $user['kullanici_id'],
+                    'GuncellemeTarihi'     => date('Y-m-d H:i:s'),
+                ], ['Tickets_id' => $ticketId]);
+
+                echo json_encode(['success' => true, 'message' => 'Kaynak güncellendi.'], JSON_UNESCAPED_UNICODE);
+                exit;
+
+            // -----------------------------------------------------------------
             // Mesaj gönder: kuyruğa eklenir, çalıştırıcı --resume ile işler
             // -----------------------------------------------------------------
             case 'mesaj_gonder':
@@ -522,7 +542,7 @@ $ticket = $ticketId > 0 ? $db->fetchOne(
     "SELECT t.Tickets_id, t.Tickets_no, t.Tickets_konu,
             CONVERT(VARCHAR(16), t.OlusturmaTarihi, 120) AS acilis,
             dur.Ticket_Durumlar_ad AS durum_ad, dur.Ticket_Durumlar_renk AS durum_renk, dur.Ticket_Durumlar_ikon AS durum_ikon,
-            t.Tickets_durum_id AS durum_id, t.Tickets_oncelik_id AS oncelik_id,
+            t.Tickets_durum_id AS durum_id, t.Tickets_oncelik_id AS oncelik_id, t.Tickets_kaynak_id AS kaynak_id,
             onc.Ticket_Oncelikler_ad AS oncelik_ad, onc.Ticket_Oncelikler_renk AS oncelik_renk, onc.Ticket_Oncelikler_ikon AS oncelik_ikon,
             kay.Ticket_Kaynak_ad AS kaynak_ad, kay.Ticket_Kaynak_api_url AS kaynak_url,
             ac.kullanici_ad + ' ' + ac.kullanici_soyad AS acan,
@@ -557,6 +577,14 @@ $durumTanimlari = $ticket ? $db->fetchAll(
 $oncelikTanimlari = $ticket ? $db->fetchAll(
     "SELECT Ticket_Oncelikler_id AS id, Ticket_Oncelikler_ad AS ad, Ticket_Oncelikler_renk AS renk, Ticket_Oncelikler_ikon AS ikon
      FROM dbo.Ticket_Oncelikler WHERE Durum = 1 ORDER BY Ticket_Oncelikler_sira"
+) : [];
+// 0 = Panel (kaynaksız); diğerleri aktif kaynaklar
+$kaynakTanimlari = $ticket ? array_merge(
+    [['id' => 0, 'ad' => 'Panel (kaynaksız)', 'renk' => null, 'ikon' => 'bi bi-window']],
+    $db->fetchAll(
+        "SELECT Ticket_Kaynak_id AS id, Ticket_Kaynak_ad AS ad, NULL AS renk, 'bi bi-hdd-network' AS ikon
+         FROM dbo.Ticket_Kaynak WHERE Durum = 1 ORDER BY Ticket_Kaynak_ad"
+    )
 ) : [];
 $taslakPersoneller = $ticket ? $db->fetchAll(
     "SELECT kullanici_id AS id, kullanici_ad + ' ' + kullanici_soyad AS ad FROM dbo.kullanicilar WHERE kullanici_durum = 1 ORDER BY kullanici_ad"
@@ -713,7 +741,7 @@ $taslakPersoneller = $ticket ? $db->fetchAll(
                                 <div class="row g-2 mb-2">
                                     <div class="col-6"><label>Ticket No</label><div class="deger"><?= htmlspecialchars($ticket['Tickets_no'] ?? '-') ?></div></div>
                                     <div class="col-6"><label>Durum</label><div class="deger"><span class="badge rozet-degistir" id="rozetDurum" data-tur="durum" data-id="<?= (int)$ticket['durum_id'] ?>" title="Durumu değiştir"></span></div></div>
-                                    <div class="col-6"><label>Kaynak</label><div class="deger"><?= htmlspecialchars($ticket['kaynak_ad'] ?? '-') ?></div></div>
+                                    <div class="col-6"><label>Kaynak</label><div class="deger"><span class="badge rozet-degistir" id="rozetKaynak" data-tur="kaynak" data-id="<?= (int)($ticket['kaynak_id'] ?? 0) ?>" title="Kaynağı değiştir"></span></div></div>
                                     <div class="col-6"><label>Öncelik</label><div class="deger"><span class="badge rozet-degistir" id="rozetOncelik" data-tur="oncelik" data-id="<?= (int)$ticket['oncelik_id'] ?>" title="Önceliği değiştir"></span></div></div>
                                     <div class="col-6"><label>Açan</label><div class="deger"><?= htmlspecialchars($ticket['acan'] ?? '-') ?></div></div>
                                     <div class="col-6"><label>Açılış</label><div class="deger"><?= htmlspecialchars($ticket['acilis'] ?? '-') ?></div></div>
@@ -798,7 +826,8 @@ const TASLAK_DURUMLAR    = <?= json_encode($taslakDurumlar, JSON_UNESCAPED_UNICO
 const TASLAK_PERSONELLER = <?= json_encode($taslakPersoneller, JSON_UNESCAPED_UNICODE) ?>;
 const ROZET_TANIMLARI = {
     durum:   { baslik: 'Durum',   liste: <?= json_encode($durumTanimlari, JSON_UNESCAPED_UNICODE) ?> },
-    oncelik: { baslik: 'Öncelik', liste: <?= json_encode($oncelikTanimlari, JSON_UNESCAPED_UNICODE) ?> }
+    oncelik: { baslik: 'Öncelik', liste: <?= json_encode($oncelikTanimlari, JSON_UNESCAPED_UNICODE) ?> },
+    kaynak:  { baslik: 'Kaynak',  liste: <?= json_encode($kaynakTanimlari, JSON_UNESCAPED_UNICODE) ?> }
 };
 
 // Durum / öncelik rozeti: tanımdaki renk ve ikonla çizilir

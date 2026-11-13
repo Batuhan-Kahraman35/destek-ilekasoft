@@ -413,6 +413,29 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
         }
 
         // -----------------------------------------------------------------
+        // kaynak_guncelle (sadece admin) - boş değer: Panel (kaynaksız)
+        // -----------------------------------------------------------------
+        if ($action === 'kaynak_guncelle') {
+            if (!$isAdmin) throw new Exception('Bu işlem için yetkiniz yok.');
+            if ($ticketId <= 0) throw new Exception('Geçersiz ticket.');
+
+            $kaynakId = intval($_POST['kaynak_id'] ?? 0);
+            if ($kaynakId > 0) {
+                $kaynak = $db->fetchOne("SELECT Ticket_Kaynak_id FROM Ticket_Kaynak WHERE Ticket_Kaynak_id = ? AND Durum = 1", [$kaynakId]);
+                if (!$kaynak) throw new Exception('Kaynak bulunamadı.');
+            }
+
+            $db->update('Tickets', [
+                'Tickets_kaynak_id'    => $kaynakId > 0 ? $kaynakId : null,
+                'GuncelleyenKullanici' => $user['kullanici_id'],
+                'GuncellemeTarihi'     => app_now(),
+            ], ['Tickets_id' => $ticketId]);
+
+            echo json_encode(['success' => true, 'message' => 'Kaynak güncellendi.']);
+            exit;
+        }
+
+        // -----------------------------------------------------------------
         // select_options (durum/öncelik/kategori/personel listesi)
         // -----------------------------------------------------------------
         if ($action === 'select_options') {
@@ -424,11 +447,12 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                        CASE WHEN NULLIF(LTRIM(RTRIM(kullanici_telefon)), '') IS NULL THEN 0 ELSE 1 END AS telefon_var,
                        CASE WHEN NULLIF(LTRIM(RTRIM(kullanici_email)), '')   IS NULL THEN 0 ELSE 1 END AS eposta_var
                 FROM kullanicilar WHERE kullanici_durum = 1 ORDER BY kullanici_ad") : [];
-            $gorevDurumlari  = $db->fetchAll("SELECT Ticket_Durumlar_id AS id, Ticket_Durumlar_ad AS ad, Ticket_Durumlar_renk AS renk, Ticket_Durumlar_kapatma_durumu AS kapatma FROM Ticket_Durumlar WHERE Durum = 1 ORDER BY Ticket_Durumlar_sira");
+            $kaynaklar       = $isAdmin ? $db->fetchAll("SELECT Ticket_Kaynak_id AS id, Ticket_Kaynak_ad AS ad FROM Ticket_Kaynak WHERE Durum = 1 ORDER BY Ticket_Kaynak_ad") : [];
+            $gorevDurumlari = $db->fetchAll("SELECT Ticket_Durumlar_id AS id, Ticket_Durumlar_ad AS ad, Ticket_Durumlar_renk AS renk, Ticket_Durumlar_kapatma_durumu AS kapatma FROM Ticket_Durumlar WHERE Durum = 1 ORDER BY Ticket_Durumlar_sira");
             $hatirlatmaSecenekleri = GorevHatirlatma::secenekler($db);
             $hatirlatmaKanallari   = GorevHatirlatma::kanallar($db);
 
-            echo json_encode(['success' => true, 'data' => compact('durumlar', 'oncelikler', 'kategoriler', 'personeller', 'gorevDurumlari', 'hatirlatmaSecenekleri', 'hatirlatmaKanallari')]);
+            echo json_encode(['success' => true, 'data' => compact('durumlar', 'oncelikler', 'kategoriler', 'personeller', 'kaynaklar','gorevDurumlari', 'hatirlatmaSecenekleri', 'hatirlatmaKanallari')]);
             exit;
         }
 
@@ -950,7 +974,17 @@ if ($isAdmin) {
                                 </div>
                                 <div class="mb-2">
                                     <label>Kaynak</label>
-                                    <div class="deger mt-1" id="kaynak-badge">-</div>
+                                    <div class="d-flex align-items-center gap-2 mt-1">
+                                        <div class="deger" id="kaynak-badge">-</div>
+                                        <?php if ($isAdmin): ?>
+                                        <select id="kaynak-select" class="form-select form-select-sm select2-basic" style="max-width:160px">
+                                            <option value="">Panel (kaynaksız)</option>
+                                        </select>
+                                        <button class="btn btn-outline-primary btn-sm" type="button" id="btnKaynakKaydet" title="Kaynağı Güncelle">
+                                            <i class="bi bi-check2"></i>
+                                        </button>
+                                        <?php endif; ?>
+                                    </div>
                                 </div>
                                 <div class="mb-2">
                                     <label>Açılış Tarihi</label>
@@ -1091,6 +1125,7 @@ const CEVAP_SABLONLARI = <?= json_encode($cevapSablonlari, JSON_UNESCAPED_UNICOD
 let selectOptions = {};
 let mevcutDurumId = 0;
 let mevcutKategoriId = 0;
+let mevcutKaynakId = 0;
 let mevcutOncelikId  = 0;
 
 // Hazır cevap şablonu: {{...}} değişkenlerini aktif ticket verisiyle doldur
@@ -1446,6 +1481,30 @@ $(document).ready(function () {
         });
     });
 
+    // Kaynak Güncelle (admin)
+    $('#btnKaynakKaydet').on('click', function () {
+        const kaynakId = parseInt($('#kaynak-select').val() || 0);
+        if (kaynakId === mevcutKaynakId) { Swal.fire({ toast:true, position:'top-end', icon:'info', title:'Kaynak zaten aynı', showConfirmButton:false, timer:1500 }); return; }
+
+        const kaynak = (selectOptions.kaynaklar || []).find(k => k.id == kaynakId);
+        Swal.fire({
+            title: 'Kaynak güncellensin mi?',
+            text: (kaynak ? kaynak.ad : 'Panel (kaynaksız)') + ' olarak değiştirilecek.',
+            icon: 'question',
+            showCancelButton: true,
+            confirmButtonText: 'Evet',
+            cancelButtonText: 'İptal'
+        }).then(function (r) {
+            if (!r.isConfirmed) { $('#kaynak-select').val(mevcutKaynakId || '').trigger('change'); return; }
+            postAjax({ action: 'kaynak_guncelle', ticket_id: TICKET_ID, kaynak_id: kaynakId }, function (res) {
+                if (res.success) {
+                    Swal.fire({ toast:true, position:'top-end', icon:'success', title:'Kaynak güncellendi', showConfirmButton:false, timer:1500 });
+                    loadTicket();
+                } else { Swal.fire('Hata', res.message, 'error'); }
+            });
+        });
+    });
+
     // Hızlı işlemler (Çözüldü / Kapalı)
     $('#btnCoz').on('click', function () { hizliDurumGuncelle('Çözüldü'); });
     $('#btnKapat').on('click', function () { hizliDurumGuncelle('Kapalı'); });
@@ -1526,6 +1585,9 @@ function loadSelectOptions() {
             res.data.personeller.forEach(function (d) {
                 $('#atama-select').append(`<option value="${d.id}">${escHtml(d.ad)}</option>`);
             });
+            (res.data.kaynaklar || []).forEach(function (d) {
+                $('#kaynak-select').append(`<option value="${d.id}">${escHtml(d.ad)}</option>`);
+            });
         }
         $('.select2-basic').select2({ theme: 'bootstrap-5', width: '100%' });
 
@@ -1538,6 +1600,7 @@ function loadSelectOptions() {
             if (IS_ADMIN && t.Tickets_atanan_kullanici_id) {
                 $('#atama-select').val(t.Tickets_atanan_kullanici_id).trigger('change');
             }
+            if (IS_ADMIN) $('#kaynak-select').val(t.Tickets_kaynak_id || '').trigger('change');
         }
 
         hatirlatmaMenuleriDoldur();
@@ -1590,6 +1653,8 @@ function loadTicket() {
 
         // Kaynak
         $('#kaynak-badge').html(kaynakBadge(t.Ticket_Kaynak_ad, t.Ticket_Kaynak_tip));
+        mevcutKaynakId = parseInt(t.Tickets_kaynak_id || 0);
+        if (IS_ADMIN) $('#kaynak-select').val(t.Tickets_kaynak_id || '').trigger('change');
         $('#acilis-tarihi-panel').text(t.acilis_tarihi || '-');
         $('#son-yanit-panel').text(t.son_yanit_tarihi || '-');
 

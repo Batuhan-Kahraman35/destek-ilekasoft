@@ -210,35 +210,69 @@ class TicketService
         }
 
         $now = !empty($data['olusturma_tarihi']) ? trim((string)$data['olusturma_tarihi']) : app_now();
-        $tarih = date('Ymd', strtotime($now));
-        $sayac = $this->db->fetchOne(
-            "SELECT COUNT(*) AS sayi FROM Tickets WHERE CONVERT(VARCHAR(8), OlusturmaTarihi, 112) = ?",
-            [$tarih]
-        );
-        $ticketNo = 'TKT-' . $tarih . '-' . str_pad((string)(($sayac['sayi'] ?? 0) + 1), 4, '0', STR_PAD_LEFT);
 
-        $insertData = [
-            'Tickets_no' => $ticketNo,
-            'Tickets_konu' => $konu,
-            'Tickets_kategori_id' => $kategoriId,
-            'Tickets_oncelik_id' => $oncelikId,
-            'Tickets_durum_id' => (int)$ilkDurum['Ticket_Durumlar_id'],
-            'Tickets_atanan_kullanici_id' => $atananId,
-            'Tickets_olusturan_kullanici_id' => $olusturanKullaniciId,
-            'OlusturmaTarihi' => $now,
-            'GuncelleyenKullanici' => $islemKullaniciId,
-            'GuncellemeTarihi' => $now,
-            'Durum' => 1,
-        ];
-
-        if (!empty($data['bildirim_yolu_id'])) {
-            $insertData['Tickets_bildirim_yolu_id'] = (int)$data['bildirim_yolu_id'];
-        }
+        // Mükerrer kontrolü: aynı kaynak + aynı başlık + kaynağın süresi içinde → yeni kayıt açılmaz.
+        // Eşzamanlı isteklerin ikisi de kontrolü geçmesin diye kontrol ve insert uygulama kilidiyle sıralanır.
+        $kilit = null;
         if ($kaynakId !== null) {
-            $insertData['Tickets_kaynak_id'] = $kaynakId;
+            $kilit = 'tkt_mukerrer_' . md5($kaynakId . '|' . mb_strtolower($konu, 'UTF-8'));
+            $this->db->query(
+                "DECLARE @s INT; EXEC @s = sp_getapplock @Resource = ?, @LockMode = 'Exclusive', @LockOwner = 'Session', @LockTimeout = 15000;",
+                [$kilit]
+            );
         }
 
-        $ticketId = (int)$this->db->insert('Tickets', $insertData);
+        try {
+            if ($kaynakId !== null) {
+                $mevcut = $this->mukerrerTicketBul($kaynakId, $konu, $now);
+                if ($mevcut) {
+                    return [
+                        'ticket_id' => (int)$mevcut['Tickets_id'],
+                        'ticket_no' => $mevcut['Tickets_no'],
+                        'ek_sayisi' => 0,
+                        'ekler' => [],
+                        'mukerrer' => true,
+                    ];
+                }
+            }
+
+            $tarih = date('Ymd', strtotime($now));
+            $sayac = $this->db->fetchOne(
+                "SELECT COUNT(*) AS sayi FROM Tickets WHERE CONVERT(VARCHAR(8), OlusturmaTarihi, 112) = ?",
+                [$tarih]
+            );
+            $ticketNo = 'TKT-' . $tarih . '-' . str_pad((string)(($sayac['sayi'] ?? 0) + 1), 4, '0', STR_PAD_LEFT);
+
+            $insertData = [
+                'Tickets_no' => $ticketNo,
+                'Tickets_konu' => $konu,
+                'Tickets_kategori_id' => $kategoriId,
+                'Tickets_oncelik_id' => $oncelikId,
+                'Tickets_durum_id' => (int)$ilkDurum['Ticket_Durumlar_id'],
+                'Tickets_atanan_kullanici_id' => $atananId,
+                'Tickets_olusturan_kullanici_id' => $olusturanKullaniciId,
+                'OlusturmaTarihi' => $now,
+                'GuncelleyenKullanici' => $islemKullaniciId,
+                'GuncellemeTarihi' => $now,
+                'Durum' => 1,
+            ];
+
+            if (!empty($data['bildirim_yolu_id'])) {
+                $insertData['Tickets_bildirim_yolu_id'] = (int)$data['bildirim_yolu_id'];
+            }
+            if ($kaynakId !== null) {
+                $insertData['Tickets_kaynak_id'] = $kaynakId;
+            }
+
+            $ticketId = (int)$this->db->insert('Tickets', $insertData);
+        } finally {
+            if ($kilit !== null) {
+                $this->db->query(
+                    "DECLARE @s INT; EXEC @s = sp_releaseapplock @Resource = ?, @LockOwner = 'Session';",
+                    [$kilit]
+                );
+            }
+        }
 
         $ilkMesajId = (int)$this->db->insert('Ticket_Mesajlar', [
             'Ticket_Mesajlar_ticket_id' => $ticketId,
@@ -283,6 +317,35 @@ class TicketService
             'ek_sayisi' => $dosyaSonuc['ek_sayisi'],
             'ekler' => $dosyaSonuc['ekler'],
         ];
+    }
+
+    /**
+     * Aynı kaynaktan, aynı başlıkla, kaynağın mükerrer süresi (Ticket_Kaynak_mukerrer_sure_sn) içinde
+     * açılmış silinmemiş ticket'ı döner. Süre 0 ise kontrol yapılmaz.
+     */
+    private function mukerrerTicketBul(int $kaynakId, string $konu, string $now): ?array
+    {
+        $kaynak = $this->db->fetchOne(
+            "SELECT Ticket_Kaynak_mukerrer_sure_sn AS sure FROM Ticket_Kaynak WHERE Ticket_Kaynak_id = ?",
+            [$kaynakId]
+        );
+        $sure = (int)($kaynak['sure'] ?? 0);
+        if ($sure <= 0) {
+            return null;
+        }
+
+        $mevcut = $this->db->fetchOne(
+            "SELECT TOP 1 Tickets_id, Tickets_no
+             FROM Tickets
+             WHERE Durum = 1
+               AND Tickets_kaynak_id = ?
+               AND Tickets_konu = ?
+               AND OlusturmaTarihi BETWEEN DATEADD(SECOND, -?, CONVERT(DATETIME, ?, 120)) AND CONVERT(DATETIME, ?, 120)
+             ORDER BY Tickets_id DESC",
+            [$kaynakId, $konu, $sure, $now, $now]
+        );
+
+        return $mevcut ?: null;
     }
 
     /**

@@ -106,6 +106,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                     k.kullanici_soyad,
                     k.kullanici_telefon,
                     k.kullanici_durum,
+                    k.kullanici_sifre_degistirmeli,
                     k.kullanici_departman_id,
                     k.kullanici_tc_kimlik_no,
                     CONVERT(VARCHAR(10), k.kullanici_dogum_tarihi, 120) as kullanici_dogum_tarihi,
@@ -343,6 +344,169 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                 'durum' => $durum,
                 'message' => $durum === 1 ? 'Personel aktif edildi' : 'Personel pasife alındı'
             ]);
+            exit;
+        }
+
+        if ($action === 'giris_bilgisi_olustur') {
+            // Yeni şifre atanır, giriş bilgisi metni kopyalanmak üzere döner
+            if (!$pagePermissions['can_edit']) {
+                throw new Exception('Düzenleme yetkiniz bulunmamaktadır.');
+            }
+
+            $id = intval($_POST['id'] ?? 0);
+            $sifre = trim($_POST['sifre'] ?? '');
+            $sifreDegistirmeli = intval($_POST['sifre_degistirmeli'] ?? 0) === 1 ? 1 : 0;
+
+            if ($id <= 0) {
+                throw new Exception('Geçersiz kullanıcı');
+            }
+            if (mb_strlen($sifre) < 6) {
+                throw new Exception('Şifre en az 6 karakter olmalıdır');
+            }
+
+            $hedef = $db->fetchOne("SELECT kullanici_email FROM kullanicilar WHERE kullanici_id = ?", [$id]);
+            if (!$hedef || empty($hedef['kullanici_email'])) {
+                throw new Exception('Kullanıcının e-posta adresi bulunamadı');
+            }
+
+            $db->update('kullanicilar', [
+                'kullanici_sifre_hash' => password_hash($sifre, PASSWORD_DEFAULT),
+                'kullanici_sifre_degistirmeli' => $sifreDegistirmeli,
+                'kullanici_guncelleme_tarihi' => date('Y-m-d H:i:s'),
+                'kullanici_guncelleyen_id' => $_SESSION['user_id'] ?? null,
+            ], ['kullanici_id' => $id]);
+
+            $girisUrl = 'https://' . $_SERVER['HTTP_HOST'] . '/admin/';
+            $satirlar = [
+                'URL: ' . $girisUrl,
+                'Kullanıcı Adı: ' . $hedef['kullanici_email'],
+                'Şifre: ' . $sifre,
+            ];
+            if ($sifreDegistirmeli === 1) {
+                $satirlar[] = 'Not: İlk girişte şifre değiştirme zorunludur.';
+            }
+            $metin = implode("\n", $satirlar);
+
+            echo json_encode([
+                'success' => true,
+                'message' => 'Şifre güncellendi',
+                'metin' => $metin
+            ]);
+            exit;
+        }
+
+        // -----------------------------------------------------------------
+        // Claude (MCP) bağlantıları: liste, iptal, işlem logu
+        // -----------------------------------------------------------------
+        if (in_array($action, ['mcp_baglantilar', 'mcp_iptal', 'mcp_log'], true)) {
+            if (!$pagePermissions['can_edit']) {
+                throw new Exception('Düzenleme yetkiniz bulunmamaktadır.');
+            }
+        }
+
+        if ($action === 'mcp_baglantilar') {
+            $id = intval($_POST['id'] ?? 0);
+            if ($id <= 0) throw new Exception('Geçersiz id');
+
+            $baglantilar = $db->fetchAll("
+                SELECT t.Mcp_Tokenlar_id AS id,
+                       i.Mcp_Istemciler_Ad AS istemci,
+                       CONVERT(VARCHAR(16), t.OlusturmaTarihi, 120) AS olusturma,
+                       CONVERT(VARCHAR(16), t.Mcp_Tokenlar_SonKullanim, 120) AS son_kullanim,
+                       t.Mcp_Tokenlar_SonIp AS son_ip,
+                       CONVERT(VARCHAR(16), t.Mcp_Tokenlar_YenilemeBitis, 120) AS gecerlilik,
+                       CONVERT(VARCHAR(16), t.Mcp_Tokenlar_IptalTarihi, 120) AS iptal,
+                       CASE WHEN t.Mcp_Tokenlar_IptalTarihi IS NULL AND t.Durum = 1 AND t.Mcp_Tokenlar_YenilemeBitis > ? THEN 1 ELSE 0 END AS aktif
+                FROM Mcp_Tokenlar t
+                JOIN Mcp_Istemciler i ON i.Mcp_Istemciler_id = t.Mcp_Tokenlar_Istemci_id
+                WHERE t.Mcp_Tokenlar_kullanici_id = ?
+                ORDER BY aktif DESC, t.OlusturmaTarihi DESC
+            ", [app_now(), $id]);
+
+            $araclar = $db->fetchAll("
+                SELECT Mcp_Araclar_Ad AS ad, Mcp_Araclar_Baslik AS baslik
+                FROM Mcp_Araclar WHERE Durum = 1 ORDER BY Mcp_Araclar_Sira
+            ");
+
+            echo json_encode(['success' => true, 'data' => $baglantilar, 'araclar' => $araclar], JSON_UNESCAPED_UNICODE);
+            exit;
+        }
+
+        if ($action === 'mcp_iptal') {
+            $tokenId = intval($_POST['token_id'] ?? 0);
+            if ($tokenId <= 0) throw new Exception('Geçersiz bağlantı');
+
+            $db->update('Mcp_Tokenlar', [
+                'Mcp_Tokenlar_IptalTarihi' => app_now(),
+                'Durum'                    => 0,
+                'GuncelleyenKullanici'     => $user['kullanici_id'],
+                'GuncellemeTarihi'         => app_now(),
+            ], ['Mcp_Tokenlar_id' => $tokenId]);
+
+            echo json_encode(['success' => true, 'message' => 'Claude bağlantısı iptal edildi. Personelin yeniden bağlanması gerekir.'], JSON_UNESCAPED_UNICODE);
+            exit;
+        }
+
+        if ($action === 'mcp_log') {
+            $id = intval($_POST['kullanici_id'] ?? 0);
+            if ($id <= 0) throw new Exception('Geçersiz id');
+
+            $draw   = intval($_POST['draw'] ?? 1);
+            $start  = max(0, intval($_POST['start'] ?? 0));
+            $length = intval($_POST['length'] ?? 25);
+            $length = ($length < 1 || $length > 200) ? 25 : $length;
+
+            // Sıralama: kolon index → kolon adı whitelist
+            $siralamaKolonlari = [
+                0 => 'l.OlusturmaTarihi',
+                1 => 'l.Mcp_IslemLog_Arac',
+                2 => 'l.Mcp_IslemLog_Ticket_id',
+                3 => 'l.Mcp_IslemLog_Onizleme',
+                4 => 'l.Mcp_IslemLog_Basarili',
+                5 => 'l.Mcp_IslemLog_SureMs',
+            ];
+            $sirIndex = intval($_POST['order'][0]['column'] ?? 0);
+            $sirKolon = $siralamaKolonlari[$sirIndex] ?? 'l.OlusturmaTarihi';
+            $sirYon   = strtoupper((string)($_POST['order'][0]['dir'] ?? 'DESC')) === 'ASC' ? 'ASC' : 'DESC';
+
+            $where  = ['l.Mcp_IslemLog_kullanici_id = ?'];
+            $params = [$id];
+            $arac = trim((string)($_POST['arac'] ?? ''));
+            if ($arac !== '') {
+                $where[]  = 'l.Mcp_IslemLog_Arac = ?';
+                $params[] = $arac;
+            }
+            $sonuc = (string)($_POST['basarili'] ?? '');
+            if ($sonuc === '0' || $sonuc === '1') {
+                $where[]  = 'l.Mcp_IslemLog_Basarili = ?';
+                $params[] = (int)$sonuc;
+            }
+            $whereSql = implode(' AND ', $where);
+
+            $toplam = (int)($db->fetchOne("SELECT COUNT(*) AS sayi FROM Mcp_IslemLog WHERE Mcp_IslemLog_kullanici_id = ?", [$id])['sayi'] ?? 0);
+            $filtreli = (int)($db->fetchOne("SELECT COUNT(*) AS sayi FROM Mcp_IslemLog l WHERE {$whereSql}", $params)['sayi'] ?? 0);
+
+            $satirlar = $db->fetchAll("
+                SELECT CONVERT(VARCHAR(19), l.OlusturmaTarihi, 120) AS tarih,
+                       l.Mcp_IslemLog_Arac AS arac,
+                       l.Mcp_IslemLog_Ticket_id AS ticket_id,
+                       CAST(l.Mcp_IslemLog_Onizleme AS INT) AS onizleme,
+                       CAST(l.Mcp_IslemLog_Basarili AS INT) AS basarili,
+                       l.Mcp_IslemLog_SureMs AS sure_ms,
+                       l.Mcp_IslemLog_Hata AS hata,
+                       l.Mcp_IslemLog_Ip AS ip
+                FROM Mcp_IslemLog l
+                WHERE {$whereSql}
+                ORDER BY {$sirKolon} {$sirYon}, l.Mcp_IslemLog_id DESC
+                OFFSET {$start} ROWS FETCH NEXT {$length} ROWS ONLY
+            ", $params);
+
+            echo json_encode([
+                'draw'            => $draw,
+                'recordsTotal'    => $toplam,
+                'recordsFiltered' => $filtreli,
+                'data'            => $satirlar ?: [],
+            ], JSON_UNESCAPED_UNICODE);
             exit;
         }
 
@@ -877,6 +1041,54 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
         </div>
     </div>
 
+    <!-- Claude (MCP) Bağlantıları Modal -->
+    <div class="modal fade" id="claudeModal" tabindex="-1" aria-hidden="true">
+        <div class="modal-dialog modal-xl">
+            <div class="modal-content">
+                <div class="modal-header bg-info">
+                    <h5 class="modal-title"><i class="bi bi-robot"></i> Claude Bağlantıları: <span id="claudeAdSoyad"></span></h5>
+                    <button type="button" class="btn-close" data-bs-dismiss="modal"></button>
+                </div>
+                <div class="modal-body">
+                    <h6 class="fw-bold"><i class="bi bi-plug"></i> Bağlantılar</h6>
+                    <div class="table-responsive mb-4">
+                        <table class="table table-sm table-bordered align-middle mb-0">
+                            <thead class="table-light">
+                                <tr>
+                                    <th>İstemci</th><th>Bağlanma</th><th>Son kullanım</th><th>Son IP</th>
+                                    <th>Geçerlilik</th><th class="text-center">Durum</th><th class="text-center">İşlem</th>
+                                </tr>
+                            </thead>
+                            <tbody id="claudeBaglantiBody"></tbody>
+                        </table>
+                    </div>
+
+                    <div class="d-flex flex-wrap align-items-end gap-2 mb-2">
+                        <h6 class="fw-bold mb-0 me-auto"><i class="bi bi-journal-text"></i> İşlem Logu</h6>
+                        <div style="min-width:220px;">
+                            <select class="form-select form-select-sm" id="claudeFiltreArac"><option value="">Tüm araçlar</option></select>
+                        </div>
+                        <div style="min-width:160px;">
+                            <select class="form-select form-select-sm" id="claudeFiltreSonuc">
+                                <option value="">Tüm sonuçlar</option>
+                                <option value="1">Başarılı</option>
+                                <option value="0">Hatalı</option>
+                            </select>
+                        </div>
+                    </div>
+                    <table class="table table-sm table-striped w-100" id="claudeLogTable">
+                        <thead>
+                            <tr><th>Tarih</th><th>Araç</th><th>Ticket</th><th>Önizleme</th><th>Sonuç</th><th>Süre</th><th>Hata</th></tr>
+                        </thead>
+                    </table>
+                </div>
+                <div class="modal-footer">
+                    <button type="button" class="btn btn-secondary" data-bs-dismiss="modal"><i class="bi bi-x-circle"></i> Kapat</button>
+                </div>
+            </div>
+        </div>
+    </div>
+
     <script src="https://code.jquery.com/jquery-3.7.1.min.js"></script>
     <script src="https://cdn.jsdelivr.net/npm/@popperjs/core@2.11.8/dist/umd/popper.min.js" crossorigin="anonymous"></script>
     <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.7/dist/js/bootstrap.min.js" crossorigin="anonymous"></script>
@@ -1066,6 +1278,12 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                                 buttons += `<a href="/Admin/personel-form?id=${data.kullanici_id}" class="btn btn-sm btn-warning" title="Düzenle">
                                     <i class="bi bi-pencil"></i>
                                 </a> `;
+                                buttons += `<button class="btn btn-sm btn-secondary" onclick="girisBilgisiKopyala(${data.kullanici_id}, '${adSoyad}', '${data.kullanici_email}', ${data.kullanici_sifre_degistirmeli == 1 ? 1 : 0})" title="Giriş bilgilerini kopyala">
+                                    <i class="bi bi-clipboard"></i>
+                                </button> `;
+                                buttons += `<button class="btn btn-sm btn-info" onclick="claudeBaglantilari(${data.kullanici_id}, '${adSoyad}')" title="Claude bağlantıları">
+                                    <i class="bi bi-robot"></i>
+                                </button> `;
                             }
                             
                             if (permissions.can_delete) {
@@ -1382,6 +1600,212 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                     });
             });
         }
+
+        function rastgeleSifre(uzunluk = 10) {
+            const karakterler = 'ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnpqrstuvwxyz23456789';
+            const dizi = new Uint32Array(uzunluk);
+            crypto.getRandomValues(dizi);
+            return Array.from(dizi, n => karakterler[n % karakterler.length]).join('');
+        }
+
+        function panoyaKopyala(metin) {
+            if (navigator.clipboard && window.isSecureContext) {
+                return navigator.clipboard.writeText(metin);
+            }
+            return new Promise((resolve, reject) => {
+                const ta = document.createElement('textarea');
+                ta.value = metin;
+                ta.style.position = 'fixed';
+                ta.style.opacity = '0';
+                document.body.appendChild(ta);
+                ta.select();
+                document.execCommand('copy') ? resolve() : reject();
+                ta.remove();
+            });
+        }
+
+        function girisBilgisiKopyala(id, adSoyad, email, sifreDegistirmeli) {
+            Swal.fire({
+                title: 'Giriş Bilgilerini Kopyala',
+                width: 520,
+                html: `
+                    <div class="text-start">
+                        <p class="mb-2"><strong>${adSoyad}</strong></p>
+                        <div class="mb-2">
+                            <label class="form-label small mb-1">URL</label>
+                            <input type="text" class="form-control form-control-sm" value="${location.origin}/admin/" readonly>
+                        </div>
+                        <div class="mb-2">
+                            <label class="form-label small mb-1">Kullanıcı Adı</label>
+                            <input type="text" class="form-control form-control-sm" value="${email}" readonly>
+                        </div>
+                        <div class="mb-2">
+                            <label class="form-label small mb-1" for="gb_sifre">Yeni Şifre</label>
+                            <div class="input-group input-group-sm">
+                                <input type="text" class="form-control" id="gb_sifre" value="${rastgeleSifre()}" autocomplete="off">
+                                <button type="button" class="btn btn-outline-secondary" id="gb_yenile" title="Yeni şifre üret">
+                                    <i class="bi bi-arrow-repeat"></i>
+                                </button>
+                            </div>
+                        </div>
+                        <div class="form-check form-switch mb-2">
+                            <input class="form-check-input" type="checkbox" role="switch" id="gb_sifre_degistirmeli" value="1" ${sifreDegistirmeli ? 'checked' : ''}>
+                            <label class="form-check-label" for="gb_sifre_degistirmeli">İlk Girişte Şifre Değiştirme Zorunlu</label>
+                        </div>
+                        <div class="alert alert-warning py-2 small mb-0">
+                            <i class="bi bi-exclamation-triangle"></i> Kullanıcının mevcut şifresi bu yeni şifre ile değiştirilecektir.
+                        </div>
+                    </div>`,
+                showCancelButton: true,
+                confirmButtonColor: '#6c757d',
+                cancelButtonText: 'İptal',
+                confirmButtonText: '<i class="bi bi-clipboard-check"></i> Kaydet ve Kopyala',
+                showLoaderOnConfirm: true,
+                didOpen: () => {
+                    document.getElementById('gb_yenile').addEventListener('click', () => {
+                        document.getElementById('gb_sifre').value = rastgeleSifre();
+                    });
+                },
+                preConfirm: () => {
+                    const sifre = document.getElementById('gb_sifre').value.trim();
+                    if (sifre.length < 6) {
+                        Swal.showValidationMessage('Şifre en az 6 karakter olmalıdır');
+                        return false;
+                    }
+                    const body = new URLSearchParams({
+                        action: 'giris_bilgisi_olustur',
+                        id: id,
+                        sifre: sifre,
+                        sifre_degistirmeli: document.getElementById('gb_sifre_degistirmeli').checked ? 1 : 0
+                    });
+                    return fetch('/Admin/pages/personel-yonetimi.php', { method: 'POST', body })
+                        .then(r => r.json())
+                        .then(data => {
+                            if (!data.success) throw new Error(data.message);
+                            return data;
+                        })
+                        .catch(err => Swal.showValidationMessage(err.message || 'Sunucuya ulaşılamıyor.'));
+                }
+            }).then(result => {
+                if (!result.isConfirmed || !result.value) return;
+                const metin = result.value.metin;
+                table.ajax.reload(null, false);
+                panoyaKopyala(metin)
+                    .then(() => showToast('Şifre güncellendi, giriş bilgileri kopyalandı', 'success'))
+                    .catch(() => {
+                        Swal.fire({
+                            title: 'Kopyalanamadı',
+                            html: `<p class="small">Şifre güncellendi. Metni elle kopyalayın:</p>
+                                   <textarea class="form-control" rows="5" readonly>${metin}</textarea>`,
+                            icon: 'warning'
+                        });
+                    });
+            });
+        }
+
+        // ---------------- Claude (MCP) bağlantıları ----------------
+        let claudeKullaniciId = 0;
+        let claudeLogTablo = null;
+
+        function htmlKacis(v) {
+            return $('<div>').text(v ?? '').html();
+        }
+
+        function claudeBaglantilari(id, adSoyad) {
+            claudeKullaniciId = id;
+            $('#claudeAdSoyad').text(adSoyad);
+            $('#claudeFiltreArac').val('').trigger('change.select2');
+            $('#claudeFiltreSonuc').val('').trigger('change.select2');
+            claudeBaglantiYukle();
+            bootstrap.Modal.getOrCreateInstance(document.getElementById('claudeModal')).show();
+        }
+
+        function claudeBaglantiYukle() {
+            $('#claudeBaglantiBody').html('<tr><td colspan="7" class="text-center text-muted">Yükleniyor...</td></tr>');
+            $.post('/Admin/pages/personel-yonetimi.php', { action: 'mcp_baglantilar', id: claudeKullaniciId }, res => {
+                if (!res.success) { showError('Hata!', res.message); return; }
+
+                const $arac = $('#claudeFiltreArac');
+                if ($arac.find('option').length === 1) {
+                    (res.araclar || []).forEach(a => $arac.append(new Option(a.baslik + ' (' + a.ad + ')', a.ad)));
+                }
+
+                if (!res.data.length) {
+                    $('#claudeBaglantiBody').html('<tr><td colspan="7" class="text-center text-muted">Bu personelin Claude bağlantısı yok.</td></tr>');
+                    return;
+                }
+                $('#claudeBaglantiBody').html(res.data.map(b => `
+                    <tr>
+                        <td>${htmlKacis(b.istemci)}</td>
+                        <td>${htmlKacis(b.olusturma)}</td>
+                        <td>${htmlKacis(b.son_kullanim || '-')}</td>
+                        <td>${htmlKacis(b.son_ip || '-')}</td>
+                        <td>${htmlKacis(b.gecerlilik)}</td>
+                        <td class="text-center">${b.aktif == 1
+                            ? '<span class="badge bg-success">Aktif</span>'
+                            : `<span class="badge bg-secondary" title="${htmlKacis(b.iptal ? 'İptal: ' + b.iptal : 'Süresi doldu')}">Pasif</span>`}</td>
+                        <td class="text-center">${b.aktif == 1
+                            ? `<button class="btn btn-sm btn-outline-danger" onclick="claudeIptal(${b.id})" title="Bağlantıyı iptal et"><i class="bi bi-plug"></i> İptal</button>`
+                            : '-'}</td>
+                    </tr>`).join(''));
+            }, 'json');
+
+            if (claudeLogTablo) {
+                claudeLogTablo.ajax.reload();
+            } else {
+                claudeLogTablo = $('#claudeLogTable').DataTable({
+                    serverSide: true,
+                    processing: true,
+                    scrollX: true,
+                    autoWidth: false,
+                    dom: 'lrtip',
+                    pageLength: 25,
+                    language: { url: '//cdn.datatables.net/plug-ins/1.13.7/i18n/tr.json' },
+                    ajax: {
+                        url: '/Admin/pages/personel-yonetimi.php',
+                        type: 'POST',
+                        data: d => Object.assign(d, {
+                            action: 'mcp_log',
+                            kullanici_id: claudeKullaniciId,
+                            arac: $('#claudeFiltreArac').val(),
+                            basarili: $('#claudeFiltreSonuc').val()
+                        })
+                    },
+                    columns: [
+                        { data: 'tarih' },
+                        { data: 'arac', render: v => `<code>${htmlKacis(v)}</code>` },
+                        { data: 'ticket_id', render: v => v ? `<a href="/admin/ticket-detay?id=${v}" target="_blank">#${v}</a>` : '-' },
+                        { data: 'onizleme', className: 'text-center', render: v => v == 1 ? '<span class="badge bg-warning text-dark">Önizleme</span>' : '-' },
+                        { data: 'basarili', className: 'text-center', render: v => v == 1 ? '<span class="badge bg-success">Başarılı</span>' : '<span class="badge bg-danger">Hatalı</span>' },
+                        { data: 'sure_ms', className: 'text-end', render: v => v !== null ? v + ' ms' : '-' },
+                        { data: 'hata', orderable: false, render: v => v ? `<small class="text-danger">${htmlKacis(v)}</small>` : '' }
+                    ],
+                    order: [[0, 'desc']]
+                });
+            }
+        }
+
+        function claudeIptal(tokenId) {
+            confirmAction('Claude bağlantısı iptal edilsin mi?', 'Personel Claude üzerinden bu sisteme erişemez; yeniden bağlanması gerekir.', function () {
+                $.post('/Admin/pages/personel-yonetimi.php', { action: 'mcp_iptal', token_id: tokenId }, res => {
+                    if (res.success) {
+                        showSuccess('Başarılı!', res.message);
+                        claudeBaglantiYukle();
+                    } else {
+                        showError('Hata!', res.message);
+                    }
+                }, 'json');
+            });
+        }
+
+        $(function () {
+            ['#claudeFiltreArac', '#claudeFiltreSonuc'].forEach(sec => {
+                $(sec).select2({ theme: 'bootstrap-5', width: '100%', dropdownParent: $('#claudeModal'),
+                    language: { noResults: () => 'Sonuç bulunamadı' } })
+                    .on('change', () => { if (claudeLogTablo) claudeLogTablo.ajax.reload(); });
+            });
+            $('#claudeModal').on('shown.bs.modal', () => { if (claudeLogTablo) claudeLogTablo.columns.adjust(); });
+        });
 
         function kullaniciSil(id, adSoyad) {
             // Önce eşleştirme kontrolü yap

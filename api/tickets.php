@@ -241,7 +241,9 @@ try {
 
         apiResponse([
             'success' => true,
-            'message' => 'Ticket oluşturuldu.',
+            'message' => !empty($sonuc['mukerrer'])
+                ? 'Aynı başlıkla az önce açılmış ticket bulundu, yeni kayıt açılmadı.'
+                : 'Ticket oluşturuldu.',
             'data' => $sonuc,
         ]);
     }

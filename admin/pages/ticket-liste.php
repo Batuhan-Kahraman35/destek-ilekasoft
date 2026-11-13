@@ -154,6 +154,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                     t.Tickets_kategori_id,
                     t.Tickets_oncelik_id,
                     t.Tickets_durum_id,
+                    t.Tickets_kaynak_id,
                     t.Tickets_musteri_cevap_var,
                     CONVERT(VARCHAR(16), t.OlusturmaTarihi, 120)       AS acilis_tarihi,
                     CONVERT(VARCHAR(16), t.Tickets_son_yanit_tarihi, 120) AS son_yanit_tarihi,
@@ -195,8 +196,33 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             $oncelikler  = $db->fetchAll("SELECT Ticket_Oncelikler_id AS id, Ticket_Oncelikler_ad AS ad FROM Ticket_Oncelikler WHERE Durum = 1 ORDER BY Ticket_Oncelikler_sira");
             $kategoriler = $db->fetchAll("SELECT Ticket_Kategoriler_id AS id, Ticket_Kategoriler_ad AS ad FROM Ticket_Kategoriler WHERE Durum = 1 ORDER BY Ticket_Kategoriler_sira");
             $personeller = $db->fetchAll("SELECT kullanici_id AS id, kullanici_ad + ' ' + kullanici_soyad AS ad FROM kullanicilar WHERE kullanici_durum = 1 ORDER BY kullanici_ad");
+            $kaynaklar   = $isAdmin ? $db->fetchAll("SELECT Ticket_Kaynak_id AS id, Ticket_Kaynak_ad AS ad, Ticket_Kaynak_kod AS kod FROM Ticket_Kaynak WHERE Durum = 1 ORDER BY Ticket_Kaynak_ad") : [];
 
-            echo json_encode(['success' => true, 'data' => compact('durumlar', 'oncelikler', 'kategoriler', 'personeller')]);
+            echo json_encode(['success' => true, 'data' => compact('durumlar', 'oncelikler', 'kategoriler', 'personeller', 'kaynaklar')]);
+            exit;
+        }
+
+        // -----------------------------------------------------------------
+        // kaynak_guncelle (sadece admin) - boş değer: Panel (kaynaksız)
+        // -----------------------------------------------------------------
+        if ($action === 'kaynak_guncelle') {
+            if (!$isAdmin) throw new Exception('Bu işlem için yetkiniz yok.');
+
+            $ticketId = intval($_POST['ticket_id'] ?? 0);
+            $kaynakId = intval($_POST['kaynak_id'] ?? 0);
+            if ($ticketId <= 0) throw new Exception('Geçersiz ticket.');
+            if ($kaynakId > 0) {
+                $kaynak = $db->fetchOne("SELECT Ticket_Kaynak_id FROM Ticket_Kaynak WHERE Ticket_Kaynak_id = ? AND Durum = 1", [$kaynakId]);
+                if (!$kaynak) throw new Exception('Geçersiz kaynak.');
+            }
+
+            $db->update('Tickets', [
+                'Tickets_kaynak_id'    => $kaynakId > 0 ? $kaynakId : null,
+                'GuncelleyenKullanici' => $user['kullanici_id'],
+                'GuncellemeTarihi'     => app_now(),
+            ], ['Tickets_id' => $ticketId]);
+
+            echo json_encode(['success' => true, 'message' => 'Kaynak güncellendi.']);
             exit;
         }
 
@@ -317,6 +343,26 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             ], ['Tickets_id' => $ticketId]);
 
             echo json_encode(['success' => true, 'message' => 'Ticket silindi.']);
+            exit;
+        }
+
+        // -----------------------------------------------------------------
+        // ticket_toplu_sil
+        // -----------------------------------------------------------------
+        if ($action === 'ticket_toplu_sil') {
+            if (!$pagePermissions['can_delete']) throw new Exception('Silme yetkiniz bulunmamaktadır.');
+
+            $ids = array_values(array_unique(array_filter(array_map('intval', (array)($_POST['ticket_ids'] ?? [])), fn($v) => $v > 0)));
+            if (empty($ids)) throw new Exception('Silinecek ticket seçilmedi.');
+            if (count($ids) > 500) throw new Exception('Tek seferde en fazla 500 ticket silinebilir.');
+
+            $yer = implode(',', array_fill(0, count($ids), '?'));
+            $db->query(
+                "UPDATE Tickets SET Durum = 0, GuncelleyenKullanici = ?, GuncellemeTarihi = ? WHERE Durum = 1 AND Tickets_id IN ($yer)",
+                array_merge([$user['kullanici_id'], app_now()], $ids)
+            );
+
+            echo json_encode(['success' => true, 'message' => count($ids) . ' ticket silindi.']);
             exit;
         }
 
@@ -885,6 +931,11 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                                 <i class="bi bi-scissors me-1"></i> Ayır
                             </button>
                             <?php endif; ?>
+                            <?php if ($pagePermissions['can_delete'] ?? false): ?>
+                            <button class="btn btn-danger btn-sm" id="btnTopluSil" style="display:none;" onclick="ticketTopluSil()">
+                                <i class="bi bi-trash me-1"></i> Seçilenleri Sil (<span id="seciliSilSayi">0</span>)
+                            </button>
+                            <?php endif; ?>
                             <?php if ($pagePermissions['can_add'] ?? false): ?>
                             <a href="/admin/ticket-ekle" class="btn btn-success btn-sm">
                                 <i class="bi bi-plus-circle me-1"></i> Yeni Ticket
@@ -950,6 +1001,31 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
         </div>
     </div>
 </div>
+
+<?php if ($isAdmin): ?>
+<!-- Kaynak Güncelle Modal -->
+<div class="modal fade" id="modalKaynak" tabindex="-1">
+    <div class="modal-dialog modal-sm">
+        <div class="modal-content">
+            <div class="modal-header">
+                <h5 class="modal-title">Kaynak Güncelle</h5>
+                <button type="button" class="btn-close" data-bs-dismiss="modal"></button>
+            </div>
+            <div class="modal-body">
+                <input type="hidden" id="kaynak-ticket-id">
+                <label class="form-label">Yeni Kaynak</label>
+                <select id="kaynak-select" class="form-select">
+                    <option value="">Panel (kaynaksız)</option>
+                </select>
+            </div>
+            <div class="modal-footer">
+                <button type="button" class="btn btn-secondary btn-sm" data-bs-dismiss="modal">İptal</button>
+                <button type="button" class="btn btn-primary btn-sm" id="btnKaynakKaydet">Kaydet</button>
+            </div>
+        </div>
+    </div>
+</div>
+<?php endif; ?>
 
 <!-- Öncelik Güncelle Modal -->
 <div class="modal fade" id="modalOncelik" tabindex="-1">
@@ -1192,9 +1268,12 @@ $(document).ready(function () {
             },
             {
                 targets: 8,
-                render: function (data) {
-                    if (!data) return '<small class="text-muted">Panel</small>';
-                    return `<span class="badge text-bg-dark">${escHtml(data)}</span>`;
+                render: function (data, type, row) {
+                    const tiklanir = IS_ADMIN && CAN_EDIT;
+                    const cls = tiklanir ? ' hucre-duzenle' : '';
+                    const evt = tiklanir ? ` onclick="kaynakGuncelle(${row.Tickets_id}, ${row.Tickets_kaynak_id || 0})" title="Kaynağı değiştir"` : '';
+                    if (!data) return `<small class="text-muted${cls}"${evt}>Panel</small>`;
+                    return `<span class="badge text-bg-dark${cls}"${evt}>${escHtml(data)}</span>`;
                 }
             },
             {
@@ -1271,6 +1350,8 @@ $(document).ready(function () {
     $('#btnKategoriKaydet').on('click', saveKategori);
     // Öncelik kaydet
     $('#btnOncelikKaydet').on('click', saveOncelik);
+    // Kaynak kaydet (admin)
+    $('#btnKaynakKaydet').on('click', saveKaynak);
     // Atama kaydet
     $('#btnAtamaKaydet').on('click', saveAtama);
     
@@ -1411,6 +1492,9 @@ function loadFilterOptions() {
             res.data.personeller.forEach(function (d) {
                 $('#filtre-atanan, #atama-select, #ayir-atanan').append(`<option value="${d.id}">${escHtml(d.ad)}</option>`);
             });
+            (res.data.kaynaklar || []).forEach(function (d) {
+                $('#kaynak-select').append(`<option value="${d.id}">${escHtml(d.ad)}${d.kod ? ' (' + escHtml(d.kod) + ')' : ''}</option>`);
+            });
         }
 
         // Select2 modal olanlar
@@ -1501,6 +1585,34 @@ function saveKategori() {
     postAjax({ action: 'kategori_guncelle', ticket_id: ticketId, kategori_id: kategoriId }, function (res) {
         if (res.success) {
             bootstrap.Modal.getInstance(document.getElementById('modalKategori')).hide();
+            Swal.fire({ icon: 'success', title: 'Güncellendi', timer: 1500, showConfirmButton: false });
+            loadListe();
+        } else {
+            Swal.fire('Hata', res.message, 'error');
+        }
+    });
+}
+
+// -------------------------------------------------------
+// Kaynak güncelle (admin)
+// -------------------------------------------------------
+function kaynakGuncelle(ticketId, mevcutId) {
+    $('#kaynak-ticket-id').val(ticketId);
+    const modal = new bootstrap.Modal(document.getElementById('modalKaynak'));
+    modal.show();
+    setTimeout(function () {
+        $('#kaynak-select').select2({ theme: 'bootstrap-5', width: '100%', dropdownParent: $('#modalKaynak') });
+        $('#kaynak-select').val(mevcutId || '').trigger('change');
+    }, 300);
+}
+
+function saveKaynak() {
+    const ticketId = $('#kaynak-ticket-id').val();
+    const kaynakId = $('#kaynak-select').val() || 0;
+
+    postAjax({ action: 'kaynak_guncelle', ticket_id: ticketId, kaynak_id: kaynakId }, function (res) {
+        if (res.success) {
+            bootstrap.Modal.getInstance(document.getElementById('modalKaynak')).hide();
             Swal.fire({ icon: 'success', title: 'Güncellendi', timer: 1500, showConfirmButton: false });
             loadListe();
         } else {
@@ -1629,8 +1741,38 @@ $(document).on('change', '.ticket-check', function() {
 function seciliGuncelle() {
     const sayi = $('.ticket-check:checked').length;
     $('#seciliSayi').text(sayi);
+    $('#seciliSilSayi').text(sayi);
     $('#btnBirlestir').toggle(sayi >= 2);
     $('#btnAyir').toggle(sayi === 1);
+    $('#btnTopluSil').toggle(sayi >= 1);
+}
+
+// -------------------------------------------------------
+// Toplu silme
+// -------------------------------------------------------
+function ticketTopluSil() {
+    const ids = $('.ticket-check:checked').map(function () { return $(this).val(); }).get();
+    if (!ids.length) return;
+
+    Swal.fire({
+        title: 'Emin misiniz?',
+        text: ids.length + ' ticket silinecek.',
+        icon: 'warning',
+        showCancelButton: true,
+        confirmButtonText: 'Evet, Sil',
+        cancelButtonText: 'İptal',
+        confirmButtonColor: '#dc3545'
+    }).then(function (result) {
+        if (!result.isConfirmed) return;
+        postAjax({ action: 'ticket_toplu_sil', ticket_ids: ids }, function (res) {
+            if (res.success) {
+                Swal.fire({ icon: 'success', title: res.message, timer: 1500, showConfirmButton: false });
+                loadListe();
+            } else {
+                Swal.fire('Hata', res.message, 'error');
+            }
+        });
+    });
 }
 
 // -------------------------------------------------------
